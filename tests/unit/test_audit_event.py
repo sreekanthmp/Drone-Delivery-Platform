@@ -10,6 +10,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+
 from app.domain.exceptions import AuditEventValidationError
 from app.domain.models import AuditEvent, AuditEventType, EventSource, OrderStatus
 

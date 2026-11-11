@@ -32,6 +32,7 @@ from typing import Any, Final
 from uuid import UUID, uuid4
 
 from app.domain.exceptions import (
+    InconsistentTransitionResultError,
     InvalidTransitionError,
     MissingTransitionContextError,
     OrderValidationError,
@@ -84,10 +85,33 @@ def _utc_now() -> datetime:
 
 @dataclass(frozen=True, slots=True)
 class TransitionResult:
-    """The outcome of a successful ``create`` or ``transition``."""
+    """The outcome of a successful ``create`` or ``transition``.
+
+    Persistence accepts this type as proof that a status change went through the
+    state machine, so it refuses to exist in an inconsistent form: the audit event
+    must describe exactly this order, and a status change must be an allowed edge.
+    """
 
     order: Order
     audit_event: AuditEvent
+
+    def __post_init__(self) -> None:
+        order, event = self.order, self.audit_event
+        if (
+            event.order_id != order.id
+            or event.new_state is not order.status
+            or event.drone_id != order.drone_id
+        ):
+            raise InconsistentTransitionResultError(
+                "the audit event does not describe the resulting order"
+            )
+        if (
+            event.event_type is AuditEventType.ORDER_STATUS_CHANGED
+            and event.previous_state is not None
+            and event.new_state is not None
+            and event.new_state not in ALLOWED_TRANSITIONS[event.previous_state]
+        ):
+            raise InvalidTransitionError(event.previous_state, event.new_state)
 
 
 class OrderStateMachine:

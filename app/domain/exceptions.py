@@ -52,3 +52,7 @@ class TerminalStateError(InvalidTransitionError):
 
 class MissingTransitionContextError(DomainError):
     """A transition is valid but the caller did not supply data it requires."""
+
+
+class InconsistentTransitionResultError(DomainError):
+    """A transition result pairs an order with an audit event that does not match it."""

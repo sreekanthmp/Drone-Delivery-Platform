@@ -8,6 +8,7 @@ from dataclasses import FrozenInstanceError
 from uuid import UUID
 
 import pytest
+
 from app.domain.exceptions import (
     DomainError,
     InvalidTransitionError,
@@ -26,7 +27,6 @@ from app.domain.models import (
     Package,
 )
 from app.domain.order_state_machine import ALLOWED_TRANSITIONS, OrderStateMachine
-
 from tests.conftest import DRONE_ID, T0, FakeClock, SequentialIds
 
 S = OrderStatus

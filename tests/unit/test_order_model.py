@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
+
 from app.domain.exceptions import OrderValidationError
 from app.domain.models import (
     ACTIVE_STATES,
@@ -18,7 +19,6 @@ from app.domain.models import (
     OrderStatus,
     Package,
 )
-
 from tests.conftest import DRONE_ID, STATUSES_WITH_DRONE, T0
 
 S = OrderStatus

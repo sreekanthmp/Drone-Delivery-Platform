@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+
 from app.domain.models import Location, Order, OrderStatus, Package
 from app.domain.order_state_machine import OrderStateMachine
 

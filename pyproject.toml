@@ -5,7 +5,15 @@ description = "B2B drone delivery platform: order intake, dispatch, compliance, 
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 # Runtime dependencies are added in the phase that first needs them.
-dependencies = []
+dependencies = [
+    "alembic>=1.20.1",
+    "asyncpg>=0.32.0",
+    "geoalchemy2>=0.21.0",
+    "pydantic>=2.14.3",
+    "pydantic-settings>=2.16.2",
+    "sqlalchemy[asyncio]>=2.1.8",
+    "structlog>=26.1.0",
+]
 
 [dependency-groups]
 dev = [
@@ -33,7 +41,7 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["app", "tests", "simulator"]
+src = ["."]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "C4", "PT"]
@@ -41,4 +49,9 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "C4", "PT"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["app/domain"]
+files = ["app"]
+
+[[tool.mypy.overrides]]
+# Third-party packages without type information.
+module = ["geoalchemy2", "geoalchemy2.*", "asyncpg", "asyncpg.*"]
+ignore_missing_imports = true

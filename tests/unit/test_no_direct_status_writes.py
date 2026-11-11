@@ -1,0 +1,264 @@
+"""Architecture test for Rule 4: order status is never written outside the state machine path.
+
+The only legitimate path is::
+
+    OrderStateMachine.create/transition  ->  TransitionResult
+        ->  OrderService  ->  SqlAlchemyOrderStore.insert/apply_transition
+
+This scans every module under ``app/`` (AST based, so comments and docstrings do not
+count) and fails if code outside that path:
+
+* assigns ``<something>.status = ...`` (or ``setattr(x, "status", ...)``),
+* touches the ``OrderRecord`` / ``AuditEventRecord`` table classes,
+* contains raw SQL that writes to the order or audit tables,
+* calls ``Order.rehydrate`` (persistence-only) or ``dataclasses.replace(..., status=...)``,
+* calls the store's write methods (``apply_transition`` / ``orders.insert``).
+
+It is a heuristic guard-rail, not a proof: the database triggers are the backstop for
+anything an AST scan cannot see.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+APP_DIR = ROOT / "app"
+
+_MODELS = "app/db/models/__init__.py"
+_MIGRATION_ENV = "app/db/migrations/env.py"  # imports the tables only to register them
+RECORD_CLASS_HOMES: dict[str, set[str]] = {
+    "OrderRecord": {
+        _MODELS,
+        "app/db/models/order.py",
+        "app/db/repositories/orders.py",
+        _MIGRATION_ENV,
+    },
+    "AuditEventRecord": {
+        _MODELS,
+        "app/db/models/audit_event.py",
+        "app/db/repositories/audit.py",
+        _MIGRATION_ENV,
+    },
+}
+REHYDRATE_HOME_PREFIX = "app/db/"
+REPLACE_STATUS_HOMES = {"app/domain/order_state_machine.py"}
+STORE_WRITE_HOMES = {"app/services/order_service.py"}
+SQL_EXEMPT_PREFIX = "app/db/migrations/"
+
+RAW_SQL_WRITE = re.compile(
+    r"\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO|TRUNCATE(?:\s+TABLE)?)\s+"
+    r"(orders|audit_events|order_transitions)\b",
+    re.IGNORECASE,
+)
+
+
+def _docstring_constants(tree: ast.AST) -> set[int]:
+    found: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            first = node.body[0] if node.body else None
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                found.add(id(first.value))
+    return found
+
+
+def _flatten(targets: list[ast.expr]) -> list[ast.expr]:
+    flat: list[ast.expr] = []
+    for target in targets:
+        if isinstance(target, ast.Tuple | ast.List):
+            flat.extend(_flatten(list(target.elts)))
+        else:
+            flat.append(target)
+    return flat
+
+
+def _is_self(node: ast.expr) -> bool:
+    return isinstance(node, ast.Name) and node.id in {"self", "cls"}
+
+
+def find_violations(source: str, path: str) -> list[str]:
+    """Return a description of every Rule 4 violation in ``source`` (``path`` is repo-relative)."""
+    tree = ast.parse(source)
+    docstrings = _docstring_constants(tree)
+    violations: list[str] = []
+
+    for node in ast.walk(tree):
+        # 1. status assignment
+        if isinstance(node, ast.Assign | ast.AugAssign | ast.AnnAssign):
+            raw = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in _flatten(list(raw)):
+                if (
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "status"
+                    and not _is_self(target.value)
+                ):
+                    violations.append(f"line {node.lineno}: assigns .status")
+
+        if isinstance(node, ast.Call):
+            func = node.func
+            # setattr(x, "status", ...)
+            if (
+                isinstance(func, ast.Name)
+                and func.id == "setattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "status"
+                and not _is_self(node.args[0])
+            ):
+                violations.append(f"line {node.lineno}: setattr(..., 'status', ...)")
+            # Order.rehydrate(...)
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "rehydrate"
+                and not path.startswith(REHYDRATE_HOME_PREFIX)
+            ):
+                violations.append(f"line {node.lineno}: calls rehydrate outside app/db")
+            # replace(order, status=...)
+            is_replace = (isinstance(func, ast.Name) and func.id == "replace") or (
+                isinstance(func, ast.Attribute) and func.attr == "replace"
+            )
+            if (
+                is_replace
+                and any(keyword.arg == "status" for keyword in node.keywords)
+                and path not in REPLACE_STATUS_HOMES
+            ):
+                violations.append(
+                    f"line {node.lineno}: replace(..., status=...) outside the state machine"
+                )
+            # store write methods
+            if isinstance(func, ast.Attribute) and path not in STORE_WRITE_HOMES:
+                if func.attr == "apply_transition":
+                    violations.append(
+                        f"line {node.lineno}: calls apply_transition outside OrderService"
+                    )
+                if (
+                    func.attr == "insert"
+                    and isinstance(func.value, ast.Attribute)
+                    and func.value.attr == "orders"
+                ):
+                    violations.append(
+                        f"line {node.lineno}: calls orders.insert outside OrderService"
+                    )
+
+        # 2. table classes
+        if (
+            isinstance(node, ast.Name)
+            and node.id in RECORD_CLASS_HOMES
+            and path not in RECORD_CLASS_HOMES[node.id]
+        ):
+            violations.append(f"line {node.lineno}: uses {node.id} outside its repository")
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr in RECORD_CLASS_HOMES
+            and path not in RECORD_CLASS_HOMES[node.attr]
+        ):
+            violations.append(f"line {node.lineno}: uses {node.attr} outside its repository")
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in RECORD_CLASS_HOMES and path not in RECORD_CLASS_HOMES[alias.name]:
+                    violations.append(
+                        f"line {node.lineno}: imports {alias.name} outside its repository"
+                    )
+
+        # 3. raw SQL
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings
+            and not path.startswith(SQL_EXEMPT_PREFIX)
+            and RAW_SQL_WRITE.search(node.value)
+        ):
+            violations.append(f"line {node.lineno}: raw SQL writes to a guarded table")
+
+    return violations
+
+
+def app_modules() -> list[Path]:
+    return sorted(APP_DIR.rglob("*.py"))
+
+
+def _relative(path: Path) -> str:
+    return path.relative_to(ROOT).as_posix()
+
+
+def test_the_scan_covers_the_modules_that_matter() -> None:
+    names = {_relative(p) for p in app_modules()}
+    assert {
+        "app/db/repositories/orders.py",
+        "app/db/repositories/audit.py",
+        "app/services/order_service.py",
+        "app/domain/order_state_machine.py",
+        "app/db/migrations/versions/0001_initial_schema.py",
+    } <= names
+
+
+@pytest.mark.parametrize("path", app_modules(), ids=_relative)
+def test_module_has_no_direct_status_writes(path: Path) -> None:
+    assert find_violations(path.read_text(), _relative(path)) == []
+
+
+class TestTheDetectorItself:
+    @pytest.mark.parametrize(
+        ("source", "path"),
+        [
+            ("order.status = OrderStatus.DELIVERED", "app/api/internal/orders.py"),
+            ("record.status = 'delivered'", "app/telemetry/mqtt_ingest.py"),
+            ("order.status += 1", "app/dispatch/assignment.py"),
+            ("a, order.status = 1, 2", "app/dispatch/assignment.py"),
+            ("order.status: str = 'x'", "app/dispatch/assignment.py"),
+            ("setattr(order, 'status', s)", "app/api/internal/orders.py"),
+            ("from app.db.models import OrderRecord", "app/services/other.py"),
+            ("session.add(OrderRecord(id=1))", "app/api/internal/orders.py"),
+            ("stmt = update(OrderRecord).values(status='x')", "app/telemetry/mqtt_ingest.py"),
+            ("import app.db.models as m\nm.OrderRecord", "app/api/ops/dash.py"),
+            ("from app.db.models import AuditEventRecord", "app/api/ops/dash.py"),
+            ("delete(AuditEventRecord)", "app/webhooks/sender.py"),
+            ("db.execute(\"UPDATE orders SET status = 'x'\")", "app/api/internal/orders.py"),
+            ("db.execute('delete from audit_events')", "app/api/internal/orders.py"),
+            ("db.execute('INSERT INTO orders VALUES (1)')", "app/dispatch/mission.py"),
+            ("db.execute('TRUNCATE TABLE audit_events')", "app/dispatch/mission.py"),
+            ("db.execute(f'UPDATE orders SET status = {x}')", "app/dispatch/mission.py"),
+            ("Order.rehydrate(id=1)", "app/api/internal/orders.py"),
+            ("order = dataclasses.replace(order, status=s)", "app/dispatch/assignment.py"),
+            ("order = replace(order, status=s)", "app/dispatch/assignment.py"),
+            ("await uow.orders.apply_transition(result)", "app/telemetry/mqtt_ingest.py"),
+            ("await uow.orders.insert(result)", "app/api/internal/orders.py"),
+        ],
+    )
+    def test_flags_writes_outside_the_blessed_path(self, source: str, path: str) -> None:
+        assert find_violations(source, path) != []
+
+    @pytest.mark.parametrize(
+        ("source", "path"),
+        [
+            ("self.status = 'connected'", "app/telemetry/mqtt_ingest.py"),
+            ("setattr(self, 'status', 'x')", "app/dispatch/assignment.py"),
+            ("current = order.status", "app/api/internal/orders.py"),
+            ("if order.status is OrderStatus.CREATED: ...", "app/api/internal/orders.py"),
+            ('def f():\n    """Runs UPDATE orders SET status = 1 in prose."""\n', "app/api/x.py"),
+            ("stmt = update(OrderRecord)", "app/db/repositories/orders.py"),
+            ("x = AuditEventRecord", "app/db/repositories/audit.py"),
+            ("Order.rehydrate(id=1)", "app/db/repositories/orders.py"),
+            ("db.execute('UPDATE orders SET x = 1')", "app/db/migrations/versions/0002_x.py"),
+            ("o = replace(order, drone_id=None)", "app/dispatch/assignment.py"),
+            ("'a-b'.replace('-', '_')", "app/api/x.py"),
+            ("o = replace(order, status=s)", "app/domain/order_state_machine.py"),
+            ("await uow.orders.apply_transition(r)", "app/services/order_service.py"),
+            ("await uow.orders.insert(r)", "app/services/order_service.py"),
+            ("await uow.orders.get(order_id)", "app/api/internal/orders.py"),
+            ("await uow.audit.list_for_order(order_id)", "app/api/ops/dash.py"),
+            ("db.execute('SELECT * FROM orders')", "app/api/ops/dash.py"),
+            ("db.execute('SELECT * FROM audit_events')", "app/api/ops/dash.py"),
+        ],
+    )
+    def test_allows_legitimate_code(self, source: str, path: str) -> None:
+        assert find_violations(source, path) == []
