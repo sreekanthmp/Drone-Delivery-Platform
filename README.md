@@ -66,6 +66,54 @@ result = machine.transition(
 `AuditEvent` that describes the change. Invalid changes raise `InvalidTransitionError`
 (or `TerminalStateError`) and produce nothing.
 
+## Partner API and adapters (Rule 3)
+
+Partners never reach core logic. Every partner request goes through one gateway and is
+handled by that partner's **adapter**, which validates the payload, maps it into the
+internal `OrderRequest`, and renders every response and error in the partner's own format.
+Only internal types cross into `OrderService`.
+
+| Endpoint | Caller | Behaviour |
+|---|---|---|
+| `POST /partner/{client_id}/orders` | partner | Parse via the adapter, create the order. `201` if new, `200` if the partner's id was already seen (idempotent) |
+| `GET /partner/{client_id}/orders/{external_order_id}` | partner | Look up by the partner's own id; partner-format body |
+| `GET /internal/orders/{order_id}` | internal | Platform-format order |
+| `GET /internal/orders/{order_id}/status` | internal | Status, terminal flag, last update |
+| `GET /health`, `GET /ready` | ops | Liveness; readiness (checks the database) |
+
+There is no `PUT`/`PATCH`/`DELETE` and no endpoint that accepts a status: orders move only
+through the state machine (Rule 4). Cancellation is not exposed yet, because cancelling an
+in-flight order must also recall the drone, which belongs to dispatch.
+
+Integrations: `mock` (generic, for development and tests), `swiggy` and `zomato`.
+
+> **The Swiggy and Zomato payload formats are illustrative, not the partners' real
+> contracts.** They exist to exercise the adapter architecture (unit conversion, differing
+> coordinate order, different status vocabularies and error shapes). When the real
+> specifications are available, replace the mapping inside `app/adapters/<partner>/`; nothing
+> outside that package changes.
+
+**There is no authentication** (it has not been requested): partners are identified only by
+`client_id` in the URL. Do not expose these endpoints publicly until auth is added.
+
+### Adding a partner
+
+1. Create `app/adapters/<name>/` with `schemas.py` (Pydantic inbound models built from
+   `app.adapters.common`) and `adapter.py` implementing `ClientAdapter`
+   (`parse_order`, `render_order`, `render_status_update`, `render_error`).
+2. Register it in `app/adapters/registry.py::default_registry`.
+3. Add a sample payload to `tests/payloads.py` (`VALID_PAYLOADS`, `EXTERNAL_IDS`) and the
+   response accessors in `tests/api/conftest.py`. The contract tests in
+   `tests/unit/adapters/test_adapter_contract.py` then apply to it automatically: junk
+   input must raise only `AdapterValidationError`, every status must translate, responses
+   must be JSON-serialisable and must not leak internal data such as the drone id.
+4. Write the partner-specific mapping tests.
+
+Import boundaries are enforced by `tests/unit/test_import_boundaries.py`: adapters import
+only the domain and Pydantic; core code never imports adapters or the HTTP layer; the API
+layer never touches the database layer; and partner names appear nowhere outside
+`app/adapters/`.
+
 ## How Rules 4 and 5 are enforced
 
 Several independent layers, so no single mistake can break a rule:
@@ -115,6 +163,24 @@ uv run ruff format --check . # formatting
 uv run mypy                  # strict type-check of app/
 ```
 
+### Running the API
+
+```bash
+uv run uvicorn app.main:create_app --factory --reload   # needs the database from above
+# or, with everything in containers (applies migrations, then serves on :8000):
+docker compose up --build
+```
+
+Interactive docs are at `http://localhost:8000/docs`. Example:
+
+```bash
+curl -X POST localhost:8000/partner/mock/orders -H 'content-type: application/json' -d '{
+  "order_id": "ORD-1",
+  "pickup":  {"lat": 12.9716, "lng": 77.5946},
+  "dropoff": {"lat": 12.9352, "lng": 77.6245},
+  "package": {"weight_kg": 1.5, "description": "2 meals"}}'
+```
+
 ### Integration tests
 
 Tests marked `integration` need PostgreSQL with PostGIS. A migrated template database is
@@ -133,7 +199,7 @@ database can never look like a green run.
 |---|---|---|
 | 1 | Foundation and domain core: order model, state machine, audit event, exceptions | **done** |
 | 2 | Persistence and audit: PostgreSQL/PostGIS, async SQLAlchemy, Alembic, `OrderService`, append-only audit table, DB lifecycle guard | **done** |
-| 3 | Client adapters (mock, Swiggy, Zomato) and order API | planned |
+| 3 | Client adapters (mock, Swiggy, Zomato) and order API, Dockerfile | **done** |
 | 4 | Compliance (mock Digital Sky) and dispatch (assignment, missions, high-level commands) | planned |
 | 5 | Telemetry: MQTT ingest, Redis, WebSockets, drone simulator | planned |
 | 6 | Webhooks: sender, retries, idempotency, failure tracking | planned |
@@ -170,3 +236,18 @@ database can never look like a green run.
 - [2026-11-11] Docker Compose contains only PostgreSQL/PostGIS for now; Redis and Mosquitto arrive with telemetry (Phase 5) and the app image with the API (Phase 3): nothing unused and untestable.
 - [2026-11-11] `structlog` is configured now (`app/logging.py`) because the service logs every create and transition: avoids retrofitting logging across phases.
 - [2026-11-11] `mypy --strict` now covers all of `app/`, and ruff treats the project root as first-party: consistent import grouping and type checking everywhere.
+- [2026-11-12] Partner traffic enters through one generic gateway (`/partner/{client_id}/...`) that dispatches to that partner's adapter: routing is written once, and each adapter owns its payload and response formats (Rule 3).
+- [2026-11-12] `OrderRequest` is the only type that crosses from adapters into core, and the gateway unpacks it into the unchanged `OrderService.create_order`: partner formats cannot leak, and no Phase 2 call site changed.
+- [2026-11-12] Adapters import only the domain and Pydantic, core never imports adapters or the HTTP layer, the API never imports the database layer, and partner names appear only under `app/adapters/`: all enforced by tests, not convention.
+- [2026-11-12] Inbound partner models are tolerant readers (unknown fields ignored) but strict about the fields they read (no string-to-number coercion, no booleans as numbers, no NaN/infinity): forward-compatible with partners without accepting garbage.
+- [2026-11-12] Validation errors carry a field path and message but never echo the offending value, and adapters must raise only `AdapterValidationError`: nothing sensitive or internal leaks into partner responses.
+- [2026-11-12] Partner ids are whitespace-stripped and capped at 128 chars, descriptions at 500: the idempotency key is normalised and unbounded partner strings do not reach the database.
+- [2026-11-12] The Swiggy and Zomato formats are illustrative, because the real specifications are not available: the mapping is isolated per package so the real contracts replace it without touching anything else.
+- [2026-11-12] Every partner gets `201` for a new order and `200` for a repeat or lookup; errors are rendered in the partner's format; an unknown client gets a neutral 404; unexpected failures become a partner-format 500 with no internal detail.
+- [2026-11-12] No cancel endpoint until dispatch exists (Phase 4): cancelling an in-flight order without a return-to-home command would leave a drone flying on a cancelled order.
+- [2026-11-12] The internal API is read-only and in platform format, and a test inspects the OpenAPI document to prove no operation can write a status (Rule 4); the inspection is itself tested against a deliberately bad app so it cannot pass by seeing nothing.
+- [2026-11-12] No authentication on any endpoint, as it has not been requested: partners are identified by the URL only, so the API must not be exposed publicly yet.
+- [2026-11-12] `create_app` takes an injectable unit-of-work factory and builds the database engine in the lifespan otherwise: API tests run on the in-memory fake with no database, and startup does not fail when the database is down (readiness reports it).
+- [2026-11-12] `UnitOfWork.orders`/`.audit` are read-only protocol properties, not mutable attributes: mutable protocol attributes are invariant, so the SQLAlchemy implementation with narrower types did not satisfy the protocol (found by mypy).
+- [2026-11-12] The Docker image installs from `uv.lock` with `--frozen --no-dev` (uv pinned), and migrations run in the compose command but should be a separate release step in production: reproducible images with no test tooling.
+- [2026-11-12] Creation audit metadata records only `client_id`; the raw partner payload is never stored in the domain or the audit log: partner formats stay out of core data.

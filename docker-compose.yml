@@ -1,5 +1,5 @@
-# Local infrastructure. Phase 2 needs PostgreSQL + PostGIS only.
-# Redis and Mosquitto are added in the telemetry phase, the app image in the API phase.
+# Local infrastructure and the API.
+# Redis and Mosquitto are added in the telemetry phase.
 services:
   postgres:
     image: postgis/postgis:16-3.4
@@ -16,6 +16,32 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Inside the compose network the database host is the service name, not localhost.
+      DATABASE_URL: postgresql+asyncpg://drone:drone@postgres:5432/drone
+    ports:
+      - "8000:8000"
+    # Apply migrations, then serve. In production run migrations as a separate release step.
+    command:
+      - sh
+      - -c
+      - alembic upgrade head && uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
 volumes:
   pgdata:

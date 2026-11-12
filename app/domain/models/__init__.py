@@ -9,6 +9,7 @@ from app.domain.models.order import (
     OrderStatus,
     Package,
 )
+from app.domain.models.order_request import OrderRequest
 
 __all__ = [
     "ACTIVE_STATES",
@@ -18,6 +19,7 @@ __all__ = [
     "EventSource",
     "Location",
     "Order",
+    "OrderRequest",
     "OrderStatus",
     "Package",
 ]

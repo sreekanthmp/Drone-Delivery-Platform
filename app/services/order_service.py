@@ -142,6 +142,14 @@ class OrderService:
             raise OrderNotFoundError(order_id)
         return order
 
+    async def get_order_by_external_id(self, client_id: str, external_order_id: str) -> Order:
+        """Look an order up by the partner's own identifier."""
+        async with self._uow_factory() as uow:
+            order = await uow.orders.get_by_external_id(client_id, external_order_id)
+        if order is None:
+            raise OrderNotFoundError(client_id=client_id, external_order_id=external_order_id)
+        return order
+
     async def get_audit_trail(self, order_id: UUID) -> list[AuditEvent]:
         """The order's audit events, oldest first."""
         async with self._uow_factory() as uow:

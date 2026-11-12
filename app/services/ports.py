@@ -52,8 +52,13 @@ class AuditLog(Protocol):
 class UnitOfWork(Protocol):
     """One transaction. Leaving the block without ``commit()`` rolls everything back."""
 
-    orders: OrderStore
-    audit: AuditLog
+    # Read-only properties (not mutable attributes), so an implementation may expose
+    # narrower concrete types, e.g. ``orders: SqlAlchemyOrderStore``.
+    @property
+    def orders(self) -> OrderStore: ...
+
+    @property
+    def audit(self) -> AuditLog: ...
 
     async def __aenter__(self) -> Self: ...
 

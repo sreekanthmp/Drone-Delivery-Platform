@@ -8,11 +8,13 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic>=1.20.1",
     "asyncpg>=0.32.0",
+    "fastapi>=0.162.5",
     "geoalchemy2>=0.21.0",
     "pydantic>=2.14.3",
     "pydantic-settings>=2.16.2",
     "sqlalchemy[asyncio]>=2.1.8",
     "structlog>=26.1.0",
+    "uvicorn>=0.54.0",
 ]
 
 [dependency-groups]
@@ -21,6 +23,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.8",
     "mypy>=1.13",
+    "httpx>=0.28.1",
 ]
 
 [tool.uv]
