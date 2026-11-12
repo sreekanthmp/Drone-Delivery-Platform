@@ -12,7 +12,7 @@ from uuid import UUID
 import pytest
 
 from app.domain.exceptions import AuditEventValidationError
-from app.domain.models import AuditEvent, AuditEventType, EventSource, OrderStatus
+from app.domain.models import AuditEvent, AuditEventType, EventSource, FlightStatus, OrderStatus
 
 S = OrderStatus
 T = AuditEventType
@@ -192,3 +192,112 @@ class TestMetadataValidation:
     def test_error_names_the_offending_path(self) -> None:
         with pytest.raises(AuditEventValidationError, match=r"metadata\.a\.b\[1\]"):
             make_event(metadata={"a": {"b": [1, object()]}})
+
+
+FLIGHT = UUID(int=0xF1)
+
+
+class TestFlightEvents:
+    def flight_event(self, **overrides: Any) -> AuditEvent:
+        fields: dict[str, Any] = {
+            "event_type": T.FLIGHT_STATUS_CHANGED,
+            "previous_state": FlightStatus.PLANNED,
+            "new_state": FlightStatus.PERMISSION_GRANTED,
+            "flight_id": FLIGHT,
+        }
+        fields.update(overrides)
+        return make_event(**fields)
+
+    def test_a_flight_status_change(self) -> None:
+        event = self.flight_event()
+        assert event.flight_id == FLIGHT
+        assert event.drone_id == UUID(int=3)
+        assert (event.previous_state, event.new_state) == (
+            FlightStatus.PLANNED,
+            FlightStatus.PERMISSION_GRANTED,
+        )
+
+    def test_a_flight_created_event(self) -> None:
+        event = self.flight_event(
+            event_type=T.FLIGHT_CREATED, previous_state=None, new_state=FlightStatus.PLANNED
+        )
+        assert event.previous_state is None
+
+    @pytest.mark.parametrize(
+        ("previous", "new"),
+        [
+            (FlightStatus.PLANNED, FlightStatus.PLANNED),  # not a change
+            (None, FlightStatus.PLANNED),  # missing previous
+            (FlightStatus.PLANNED, None),  # missing new
+            (OrderStatus.CREATED, FlightStatus.PLANNED),  # an order state
+            (FlightStatus.PLANNED, OrderStatus.ASSIGNED),
+        ],
+    )
+    def test_a_status_change_needs_two_different_flight_states(
+        self, previous: Any, new: Any
+    ) -> None:
+        with pytest.raises(AuditEventValidationError):
+            self.flight_event(previous_state=previous, new_state=new)
+
+    @pytest.mark.parametrize(
+        ("previous", "new"),
+        [
+            (FlightStatus.PLANNED, FlightStatus.PLANNED),
+            (None, FlightStatus.STARTED),
+            (None, None),
+            (None, OrderStatus.CREATED),
+        ],
+    )
+    def test_flight_created_must_go_from_nothing_to_planned(self, previous: Any, new: Any) -> None:
+        with pytest.raises(AuditEventValidationError, match="planned"):
+            self.flight_event(event_type=T.FLIGHT_CREATED, previous_state=previous, new_state=new)
+
+    @pytest.mark.parametrize("missing", ["flight_id", "drone_id"])
+    @pytest.mark.parametrize("event_type", [T.FLIGHT_CREATED, T.FLIGHT_STATUS_CHANGED])
+    def test_flight_events_need_a_flight_and_a_drone(
+        self, missing: str, event_type: AuditEventType
+    ) -> None:
+        previous = None if event_type is T.FLIGHT_CREATED else FlightStatus.PLANNED
+        new = FlightStatus.PLANNED if event_type is T.FLIGHT_CREATED else FlightStatus.CANCELLED
+        with pytest.raises(AuditEventValidationError, match="flight_id and a drone_id"):
+            self.flight_event(
+                event_type=event_type, previous_state=previous, new_state=new, **{missing: None}
+            )
+
+    def test_order_events_cannot_carry_a_flight_id(self) -> None:
+        with pytest.raises(AuditEventValidationError, match="do not belong to a flight"):
+            make_event(flight_id=FLIGHT)
+        with pytest.raises(AuditEventValidationError, match="do not belong to a flight"):
+            make_event(
+                event_type=T.ORDER_CREATED,
+                previous_state=None,
+                new_state=S.CREATED,
+                flight_id=FLIGHT,
+            )
+
+    def test_order_events_cannot_carry_flight_states(self) -> None:
+        with pytest.raises(AuditEventValidationError, match="order previous_state"):
+            make_event(previous_state=FlightStatus.PLANNED, new_state=FlightStatus.CANCELLED)
+
+    def test_the_shared_cancelled_string_does_not_blur_the_vocabularies(self) -> None:
+        """OrderStatus.CANCELLED == FlightStatus.CANCELLED as strings; the event type decides."""
+        assert OrderStatus.CANCELLED == FlightStatus.CANCELLED
+        with pytest.raises(AuditEventValidationError):
+            self.flight_event(previous_state=OrderStatus.CREATED, new_state=OrderStatus.CANCELLED)
+        flight_cancel = self.flight_event(new_state=FlightStatus.CANCELLED)
+        assert isinstance(flight_cancel.new_state, FlightStatus)
+
+    def test_flight_events_are_as_immutable_as_order_events(self) -> None:
+        event = self.flight_event(metadata={"reason": "x"})
+        with pytest.raises(FrozenInstanceError):
+            event.flight_id = UUID(int=1)  # type: ignore[misc]
+        with pytest.raises(TypeError):
+            event.metadata["reason"] = "y"  # type: ignore[index]
+
+    def test_the_event_types(self) -> None:
+        assert {t.value for t in AuditEventType} == {
+            "order_created",
+            "order_status_changed",
+            "flight_created",
+            "flight_status_changed",
+        }

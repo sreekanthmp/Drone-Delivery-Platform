@@ -50,8 +50,10 @@ def test_statuses_match_the_domain(migration: ModuleType) -> None:
     assert set(migration.STATUSES) == {s.value for s in OrderStatus}
 
 
-def test_event_types_match_the_domain(migration: ModuleType) -> None:
-    assert set(migration.EVENT_TYPES) == {t.value for t in AuditEventType}
+def test_event_types_are_the_phase_2_snapshot(migration: ModuleType) -> None:
+    """0001 is frozen history: the two order event types. Flight events arrive in 0002."""
+    assert set(migration.EVENT_TYPES) == {"order_created", "order_status_changed"}
+    assert set(migration.EVENT_TYPES) < {t.value for t in AuditEventType}
 
 
 def test_sources_match_the_domain(migration: ModuleType) -> None:

@@ -21,6 +21,7 @@ from pydantic import (
 )
 
 from app.adapters.base import AdapterValidationError, FieldIssue
+from app.domain.models import AuditEvent, AuditEventType, Order, OrderStatus
 
 MAX_ID_LENGTH = 128
 MAX_DESCRIPTION_LENGTH = 500
@@ -74,3 +75,22 @@ def truncate_description(text: str) -> str:
 def iso(moment: datetime) -> str:
     """ISO-8601 timestamp in UTC."""
     return moment.astimezone(UTC).isoformat()
+
+
+_ORDER_EVENT_TYPES = frozenset({AuditEventType.ORDER_CREATED, AuditEventType.ORDER_STATUS_CHANGED})
+
+
+def order_status_of(order: Order, event: AuditEvent) -> OrderStatus:
+    """The order status an order audit event moved ``order`` into.
+
+    Partners hear about *orders*. Flight events (which use a different status vocabulary
+    that happens to share some strings, such as "cancelled") must never be translated as if
+    they were order statuses, so anything else is rejected loudly.
+    """
+    if event.event_type not in _ORDER_EVENT_TYPES or not isinstance(event.new_state, OrderStatus):
+        raise ValueError(
+            f"only order status events can be rendered for partners, got '{event.event_type}'"
+        )
+    if event.order_id != order.id:
+        raise ValueError("the event belongs to a different order")
+    return event.new_state

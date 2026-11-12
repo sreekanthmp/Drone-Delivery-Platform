@@ -9,7 +9,7 @@ from sqlalchemy.exc import DBAPIError
 
 from app.domain.models import EventSource, Order, OrderStatus
 from app.services.order_service import OrderService
-from tests.integration.conftest import RunSql, RunTx
+from tests.integration.conftest import RegisterDrone, RunSql, RunTx
 
 pytestmark = pytest.mark.integration
 
@@ -95,10 +95,15 @@ class TestAuditEventsCannotBeChanged:
 
 class TestAuditEventsAreWrittenCorrectly:
     async def test_rows_are_ordered_by_a_strictly_increasing_seq(
-        self, pg_service: OrderService, created_order: Order, run_sql: RunSql
+        self,
+        pg_service: OrderService,
+        created_order: Order,
+        run_sql: RunSql,
+        register_drone: RegisterDrone,
     ) -> None:
+        drone = await register_drone(uuid4())
         await pg_service.transition(
-            created_order.id, S.ASSIGNED, source=EventSource.DISPATCH, drone_id=uuid4()
+            created_order.id, S.ASSIGNED, source=EventSource.DISPATCH, drone_id=drone
         )
         await pg_service.transition(created_order.id, S.PICKED_UP, source=EventSource.DISPATCH)
 

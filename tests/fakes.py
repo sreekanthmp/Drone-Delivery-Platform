@@ -14,7 +14,16 @@ from types import TracebackType
 from typing import Self
 from uuid import UUID
 
-from app.domain.models import AuditEvent, AuditEventType, Order
+from app.domain.flight_state_machine import FlightTransitionResult
+from app.domain.models import (
+    AuditEvent,
+    AuditEventType,
+    Drone,
+    DroneStatus,
+    Flight,
+    Order,
+)
+from app.domain.models.drone import check_status_change
 from app.domain.order_state_machine import TransitionResult
 from app.services.exceptions import ConcurrentUpdateError
 
@@ -23,6 +32,8 @@ from app.services.exceptions import ConcurrentUpdateError
 class InMemoryDatabase:
     orders: dict[UUID, Order] = field(default_factory=dict)
     audit: list[AuditEvent] = field(default_factory=list)
+    drones: dict[UUID, Drone] = field(default_factory=dict)
+    flights: dict[UUID, Flight] = field(default_factory=dict)
     commits: int = 0
 
 
@@ -72,21 +83,99 @@ class _AuditLog:
     async def list_for_order(self, order_id: UUID) -> list[AuditEvent]:
         return [event for event in self._audit if event.order_id == order_id]
 
+    async def list_for_flight(self, flight_id: UUID) -> list[AuditEvent]:
+        return [event for event in self._audit if event.flight_id == flight_id]
+
+
+class _DroneStore:
+    def __init__(self, drones: dict[UUID, Drone]) -> None:
+        self._drones = drones
+
+    async def add(self, drone: Drone) -> bool:
+        if any(existing.name == drone.name for existing in self._drones.values()):
+            return False
+        self._drones[drone.id] = drone
+        return True
+
+    async def get(self, drone_id: UUID, *, for_update: bool = False) -> Drone | None:
+        return self._drones.get(drone_id)
+
+    async def list_all(self, *, status: DroneStatus | None = None) -> list[Drone]:
+        drones = [d for d in self._drones.values() if status is None or d.status is status]
+        return sorted(drones, key=lambda d: d.name)
+
+    async def list_available(self, *, lock: bool = False) -> list[Drone]:
+        drones = [d for d in self._drones.values() if d.status is DroneStatus.AVAILABLE]
+        return sorted(drones, key=lambda d: d.id)
+
+    async def apply_status_change(self, before: Drone, after: Drone) -> None:
+        check_status_change(before, after)
+        current = self._drones.get(before.id)
+        if current is None or current.status is not before.status:
+            raise ConcurrentUpdateError(f"drone {before.id} is not in state {before.status}")
+        self._drones[before.id] = after
+
+
+class _FlightStore:
+    def __init__(self, flights: dict[UUID, Flight], audit: list[AuditEvent]) -> None:
+        self._flights = flights
+        self._audit = audit
+
+    async def get(self, flight_id: UUID, *, for_update: bool = False) -> Flight | None:
+        return self._flights.get(flight_id)
+
+    async def list_for_order(self, order_id: UUID) -> list[Flight]:
+        flights = [f for f in self._flights.values() if f.order_id == order_id]
+        return sorted(flights, key=lambda f: (f.created_at, f.id))
+
+    async def insert(self, result: FlightTransitionResult) -> bool:
+        if result.audit_event.event_type is not AuditEventType.FLIGHT_CREATED:
+            raise ValueError("insert() needs a result produced by FlightStateMachine.create()")
+        flight = result.flight
+        for other in self._flights.values():
+            if other.status.is_live and (
+                other.drone_id == flight.drone_id or other.order_id == flight.order_id
+            ):
+                return False
+        self._flights[flight.id] = flight
+        self._audit.append(result.audit_event)
+        return True
+
+    async def apply_transition(self, result: FlightTransitionResult) -> None:
+        flight, event = result.flight, result.audit_event
+        if event.event_type is not AuditEventType.FLIGHT_STATUS_CHANGED:
+            raise ValueError("apply_transition() needs a result produced by transition()")
+        current = self._flights.get(flight.id)
+        if current is None or current.status is not event.previous_state:
+            raise ConcurrentUpdateError(
+                f"flight {flight.id} is not in state {event.previous_state}"
+            )
+        self._flights[flight.id] = flight
+        self._audit.append(event)
+
 
 class InMemoryUnitOfWork:
     orders: _OrderStore
     audit: _AuditLog
+    drones: _DroneStore
+    flights: _FlightStore
 
     def __init__(self, database: InMemoryDatabase) -> None:
         self._database = database
         self._staged_orders: dict[UUID, Order] = {}
         self._staged_audit: list[AuditEvent] = []
+        self._staged_drones: dict[UUID, Drone] = {}
+        self._staged_flights: dict[UUID, Flight] = {}
 
     async def __aenter__(self) -> Self:
         self._staged_orders = dict(self._database.orders)
         self._staged_audit = list(self._database.audit)
+        self._staged_drones = dict(self._database.drones)
+        self._staged_flights = dict(self._database.flights)
         self.orders = _OrderStore(self._staged_orders, self._staged_audit)
         self.audit = _AuditLog(self._staged_audit)
+        self.drones = _DroneStore(self._staged_drones)
+        self.flights = _FlightStore(self._staged_flights, self._staged_audit)
         return self
 
     async def __aexit__(
@@ -98,8 +187,12 @@ class InMemoryUnitOfWork:
         # Anything not committed is simply dropped with the staged copies.
         self._staged_orders = {}
         self._staged_audit = []
+        self._staged_drones = {}
+        self._staged_flights = {}
 
     async def commit(self) -> None:
         self._database.orders = dict(self._staged_orders)
         self._database.audit = list(self._staged_audit)
+        self._database.drones = dict(self._staged_drones)
+        self._database.flights = dict(self._staged_flights)
         self._database.commits += 1

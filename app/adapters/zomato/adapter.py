@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from typing import Any, Final
 
 from app.adapters.base import HTTP_STATUS_FOR_ERROR, ClientError, ClientResponse
-from app.adapters.common import iso, truncate_description, validate_payload
+from app.adapters.common import iso, order_status_of, truncate_description, validate_payload
 from app.adapters.zomato.schemas import ZomatoOrderPayload
 from app.domain.models import AuditEvent, Location, Order, OrderRequest, OrderStatus, Package
 
@@ -75,7 +75,7 @@ class ZomatoAdapter:
     def render_status_update(self, order: Order, event: AuditEvent) -> Mapping[str, Any]:
         return {
             "order_id": _public_id(order.external_order_id),
-            "state": STATE_NAMES[event.new_state or order.status],
+            "state": STATE_NAMES[order_status_of(order, event)],
             "event_ts": iso(event.occurred_at),
             "event_ref": str(event.event_id),
         }

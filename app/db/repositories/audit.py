@@ -14,7 +14,14 @@ from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import AuditEventRecord
-from app.domain.models import AuditEvent, AuditEventType, EventSource, OrderStatus
+from app.domain.models import (
+    AuditEvent,
+    AuditEventType,
+    AuditState,
+    EventSource,
+    FlightStatus,
+    OrderStatus,
+)
 
 
 def _thaw(value: object) -> Any:
@@ -26,18 +33,28 @@ def _thaw(value: object) -> Any:
     return value
 
 
+_ORDER_EVENT_TYPES = frozenset({AuditEventType.ORDER_CREATED, AuditEventType.ORDER_STATUS_CHANGED})
+
+
+def _state(event_type: AuditEventType, value: str | None) -> AuditState | None:
+    """Order and flight events use different status vocabularies that share some strings."""
+    if value is None:
+        return None
+    return OrderStatus(value) if event_type in _ORDER_EVENT_TYPES else FlightStatus(value)
+
+
 def _to_domain(record: AuditEventRecord) -> AuditEvent:
+    event_type = AuditEventType(record.event_type)
     return AuditEvent(
         event_id=record.event_id,
         order_id=record.order_id,
-        event_type=AuditEventType(record.event_type),
-        previous_state=None
-        if record.previous_state is None
-        else OrderStatus(record.previous_state),
-        new_state=None if record.new_state is None else OrderStatus(record.new_state),
+        event_type=event_type,
+        previous_state=_state(event_type, record.previous_state),
+        new_state=_state(event_type, record.new_state),
         occurred_at=record.occurred_at,
         source=EventSource(record.source),
         drone_id=record.drone_id,
+        flight_id=record.flight_id,
         metadata=record.event_metadata,
     )
 
@@ -52,6 +69,7 @@ class SqlAlchemyAuditLog:
                 event_id=event.event_id,
                 order_id=event.order_id,
                 drone_id=event.drone_id,
+                flight_id=event.flight_id,
                 event_type=event.event_type.value,
                 previous_state=None if event.previous_state is None else event.previous_state.value,
                 new_state=None if event.new_state is None else event.new_state.value,
@@ -65,6 +83,14 @@ class SqlAlchemyAuditLog:
         rows = await self._session.scalars(
             select(AuditEventRecord)
             .where(AuditEventRecord.order_id == order_id)
+            .order_by(AuditEventRecord.seq)
+        )
+        return [_to_domain(row) for row in rows]
+
+    async def list_for_flight(self, flight_id: UUID) -> list[AuditEvent]:
+        rows = await self._session.scalars(
+            select(AuditEventRecord)
+            .where(AuditEventRecord.flight_id == flight_id)
             .order_by(AuditEventRecord.seq)
         )
         return [_to_domain(row) for row in rows]

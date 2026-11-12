@@ -143,6 +143,67 @@ order = await service.transition(
 trail = await service.get_audit_trail(order.id)
 ```
 
+## Drones, flights and the Rule 2 gate
+
+A **flight** is one drone flying one mission for one order. It has its own state machine
+(`app/domain/flight_state_machine.py`), built the same way as the order's: it returns the
+new flight plus its audit event, and persistence accepts only that result.
+
+```
+planned -> permission_granted -> mission_uploaded -> started <-> paused
+planned -> permission_denied | cancelled
+permission_granted -> upload_failed | cancelled
+mission_uploaded -> cancelled
+started | paused -> aborted            started -> completed
+```
+
+**Entering `started` (the first start and a resume) is the gate.** It requires all of:
+
+1. a granted permission and a mission the drone acknowledged (by checksum),
+2. a fresh re-check of the permission with the compliance provider: not revoked or unknown,
+   and no older than 30 seconds,
+3. the permission in force right now (the earlier of what we stored and what the provider
+   reports now), and
+4. enough validity left to cover the whole mission.
+
+Anything else raises a specific error (`PermissionRevokedError`, `PermissionExpiredError`,
+`PermissionWindowTooShortError`, ...) and nothing is persisted. A successful start also yields
+a `StartAuthorization`, a token only the state machine can create, which the drone link
+(next phase) will require before it sends a start command.
+
+**Safety commands are never gated.** Pause, abort (return-to-home, land) and complete do not
+consult the permission: they must work even if it has expired or been revoked.
+
+| Layer | Enforcement of the start gate |
+|---|---|
+| Domain | `FlightStateMachine` checks all four conditions; `FlightTransitionResult` refuses to exist without a matching `StartAuthorization` for every entry into `started`, and for nothing else |
+| Architecture | `tests/unit/test_no_direct_status_writes.py` bans minting a `StartAuthorization` anywhere else, and bans writing flights or drones outside the dispatch service |
+| Database | `flights_enforce_lifecycle` (deferred constraint trigger): valid edge, audit row from the *same transaction*, write-once mission/permission columns, and for `started` a stored permission, an acknowledged mission, a permission still in force *and* long enough |
+| Database | At most one live flight per drone and per order (partial unique indexes): a drone cannot be double-booked. Drone listing uses `FOR UPDATE SKIP LOCKED` and status changes are compare-and-set |
+
+The database cannot see the provider re-check, so a raw start that satisfies its data
+conditions is accepted; the Python gate is what insists on the fresh re-check. The trigger
+compares the permission's end with the **database** clock, so keep application and database
+clocks in sync.
+
+**Compliance** (`app/compliance`) is an interface with two questions: *may this drone fly this
+route?* and *is this permission still in force?* Only a **mock Digital Sky** exists (no-fly
+circles, closed airspace, revocation, expiry, outages); a real integration is not built until
+it is requested, and the config only accepts `COMPLIANCE_PROVIDER=mock`. If the provider
+cannot be reached the platform **fails closed**: no answer means no permission.
+
+**Drone selection** (`app/dispatch/assignment.py`) is a pure function: a drone must be
+available, strong enough, charged enough, and able to fly the whole sortie (home -> pickup ->
+dropoff -> home) within its range less a safety reserve. The nearest suitable drone wins, then
+higher battery, then lowest id; every ruled-out drone is reported with its reasons.
+
+A **mission** is data (waypoints and a checksum). The cloud uploads it and may later send
+start / pause / return-to-home / land; the drone flies it (Rule 1).
+
+> Phase 4A delivers the domain, compliance interface and mock, selection, persistence and the
+> database guards. There is no HTTP API for flights yet, and no drone link: the dispatch
+> workflow, mission planner, commands and cancellation are Phase 4B.
+
 ## Development
 
 Requires Python 3.12, [uv](https://docs.astral.sh/uv/) and, for the database,
@@ -200,7 +261,8 @@ database can never look like a green run.
 | 1 | Foundation and domain core: order model, state machine, audit event, exceptions | **done** |
 | 2 | Persistence and audit: PostgreSQL/PostGIS, async SQLAlchemy, Alembic, `OrderService`, append-only audit table, DB lifecycle guard | **done** |
 | 3 | Client adapters (mock, Swiggy, Zomato) and order API, Dockerfile | **done** |
-| 4 | Compliance (mock Digital Sky) and dispatch (assignment, missions, high-level commands) | planned |
+| 4A | Drones, compliance (mock Digital Sky) and the flight lifecycle: flight state machine with the Rule 2 start gate, drone selection, drone/flight persistence and database guards | **done** |
+| 4B | Dispatch workflow, mission planner, drone link (start/pause/RTH/land), cancellation, internal dispatch API | planned |
 | 5 | Telemetry: MQTT ingest, Redis, WebSockets, drone simulator | planned |
 | 6 | Webhooks: sender, retries, idempotency, failure tracking | planned |
 | 7 | Ops dashboard APIs, hardening, end-to-end tests | planned |
@@ -251,3 +313,23 @@ database can never look like a green run.
 - [2026-11-12] `UnitOfWork.orders`/`.audit` are read-only protocol properties, not mutable attributes: mutable protocol attributes are invariant, so the SQLAlchemy implementation with narrower types did not satisfy the protocol (found by mypy).
 - [2026-11-12] The Docker image installs from `uv.lock` with `--frozen --no-dev` (uv pinned), and migrations run in the compose command but should be a separate release step in production: reproducible images with no test tooling.
 - [2026-11-12] Creation audit metadata records only `client_id`; the raw partner payload is never stored in the domain or the audit log: partner formats stay out of core data.
+- [2026-11-12] Flights are a first-class aggregate with their own state machine (10 states, 13 edges, built like the order's): Rule 2's workflow is exactly a flight's lifecycle, and it inherits the pure, audited, unforgeable-result pattern.
+- [2026-11-12] Entering `started` is the one gate for both first start and resume, and it needs a granted permission, an acknowledged mission, a fresh non-revoked provider re-check, a permission in force, and enough validity to cover the mission: a permission can expire or be revoked between grant and start, or while paused.
+- [2026-11-12] The gate trusts the earlier of the stored permission end and the provider's current answer, and a re-check older than 30 seconds is stale: the provider may shorten a permission, and a stale answer proves nothing.
+- [2026-11-12] Pause, abort (return-to-home, land) and complete are never permission-gated, and passing a validation to them is rejected: safety commands must work even when a permission has expired or been revoked.
+- [2026-11-12] A compliance outage fails closed (`provider_unavailable` denial, no permission): no answer must never be read as "probably fine".
+- [2026-11-12] A successful start yields a `StartAuthorization` that only the flight state machine can create (architecture-tested), and the drone link will require it: the start command cannot be sent by anything that skipped the gate.
+- [2026-11-12] A mission is data with a SHA-256 checksum the drone must echo back on upload: the platform can prove the drone holds exactly the mission that was planned, and the cloud never steers (Rule 1).
+- [2026-11-12] A mission covers the whole sortie (home -> pickup -> dropoff -> home) and the start command goes out once the order is `assigned`; picked_up, in_flight, arriving and delivered then arrive from telemetry through the state machine.
+- [2026-11-12] An order becomes `assigned` only after permission is granted and the mission uploaded (so `assigned` means ready to fly), while the drone is reserved earlier through the flight: orders have no way back, so an order must not be stuck `assigned` with a denied flight.
+- [2026-11-12] Flight events go into the one existing append-only audit log (a `flight_id` column, per-event-type state vocabularies in the CHECKs, the same triggers): the spec asks for "an audit log", and splitting it would split the trail.
+- [2026-11-12] The audit CHECKs spell out `IS NOT NULL` before `IN (...)`: `x IN (...)` is NULL for a NULL x and a CHECK accepts NULL, which would let an event with no previous state through.
+- [2026-11-12] Order and flight statuses share strings such as "cancelled" (they hash equal as StrEnums), so audit events type their states per event type, adapters translate order events only and refuse flight events, and tests pin both: a flight event must never be rendered as an order status.
+- [2026-11-12] At most one live flight per drone and per order is enforced by partial unique indexes, drone listing uses `FOR UPDATE SKIP LOCKED`, and status changes are compare-and-set: double-booking is impossible even if every Python check is bypassed.
+- [2026-11-12] The flights trigger demands an audit row from the *same transaction* (`recorded_at = now()`), because pause and resume repeat edges and an old audit row must not be reusable; it also makes mission and permission columns write-once so the gate's inputs cannot be edited.
+- [2026-11-12] The database gate judges permission validity with the database clock (`clock_timestamp()`), and cannot see the provider re-check: it enforces the data conditions as a backstop, not the whole gate (clock skew is a known risk).
+- [2026-11-12] Migration 0002 refuses to downgrade while flight audit events exist and refuses to upgrade while orders reference unregistered drones: the audit log is append-only so a migration will not delete it, and the new foreign key must not silently fail on old data.
+- [2026-11-12] Only a mock Digital Sky exists and the config accepts only `mock`: a real integration is not built until explicitly requested.
+- [2026-11-12] Drone battery and position are set at registration (and by operations) until telemetry exists, and drone status changes are not audited separately: flight events record the meaningful changes.
+- [2026-11-12] Drone selection is a pure function with an explicit policy (minimum battery, range reserve, maximum pickup distance) and deterministic tie-breaks: the same inputs always choose the same drone, and every rejection carries its reasons.
+- [2026-11-12] `orders.drone_id` now references the `drones` registry (RESTRICT), delivering the foreign key the Phase 2 decision on plain-UUID drone ids deferred: an order can only be assigned to a registered drone, so tests and fixtures register drones first.

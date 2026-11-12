@@ -12,7 +12,12 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import get_settings
 from app.db.base import Base
-from app.db.models import AuditEventRecord, OrderRecord  # noqa: F401 - registers the tables
+from app.db.models import (  # noqa: F401 - registers the tables
+    AuditEventRecord,
+    DroneRecord,
+    FlightRecord,
+    OrderRecord,
+)
 
 config = context.config
 if config.config_file_name is not None:

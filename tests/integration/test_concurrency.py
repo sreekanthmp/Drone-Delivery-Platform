@@ -10,7 +10,7 @@ import pytest
 from app.domain.exceptions import DomainError, InvalidTransitionError, TerminalStateError
 from app.domain.models import EventSource, Location, Order, OrderStatus, Package
 from app.services.order_service import OrderService
-from tests.integration.conftest import RunSql
+from tests.integration.conftest import RegisterDrone, RunSql
 
 pytestmark = pytest.mark.integration
 
@@ -18,9 +18,9 @@ S = OrderStatus
 
 
 async def test_only_one_of_many_concurrent_assignments_wins(
-    pg_service: OrderService, created_order: Order
+    pg_service: OrderService, created_order: Order, register_drone: RegisterDrone
 ) -> None:
-    drones = [UUID(int=i) for i in range(1, 9)]
+    drones = [await register_drone(UUID(int=i)) for i in range(1, 9)]
 
     outcomes = await asyncio.gather(
         *(
@@ -68,15 +68,16 @@ async def test_concurrent_cancellations_cancel_once(
 
 
 async def test_racing_assign_and_cancel_always_leave_a_consistent_history(
-    pg_service: OrderService, created_order: Order
+    pg_service: OrderService, created_order: Order, register_drone: RegisterDrone
 ) -> None:
     """Either order is legal (assign then cancel, or cancel then a rejected assign).
 
     Whatever interleaving happens, the stored status must equal the last audit event
     and every audit event must start where the previous one ended.
     """
+    drone = await register_drone(UUID(int=5))
     assign = pg_service.transition(
-        created_order.id, S.ASSIGNED, source=EventSource.DISPATCH, drone_id=UUID(int=5)
+        created_order.id, S.ASSIGNED, source=EventSource.DISPATCH, drone_id=drone
     )
     cancel = pg_service.transition(created_order.id, S.CANCELLED, source=EventSource.API)
 

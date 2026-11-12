@@ -14,7 +14,7 @@ from app.domain.order_state_machine import OrderStateMachine, TransitionResult
 from app.services.exceptions import ConcurrentUpdateError
 from app.services.order_service import OrderService
 from app.services.ports import UnitOfWorkFactory
-from tests.integration.conftest import RunSql
+from tests.integration.conftest import RegisterDrone, RunSql
 
 pytestmark = pytest.mark.integration
 
@@ -285,10 +285,12 @@ class TestLockingAndCompareAndSet:
         self,
         pg_uow_factory: UnitOfWorkFactory,
         run_sql: RunSql,
+        register_drone: RegisterDrone,
         pickup: Location,
         dropoff: Location,
         package: Package,
     ) -> None:
+        await register_drone(DRONE)
         machine = OrderStateMachine()
         service = OrderService(pg_uow_factory, machine)
         order = (

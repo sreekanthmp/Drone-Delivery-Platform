@@ -7,6 +7,7 @@ the in-memory fake honest.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC
 from typing import Any
 from uuid import UUID
@@ -21,6 +22,7 @@ from app.domain.exceptions import (
 )
 from app.domain.models import (
     AuditEventType,
+    Drone,
     EventSource,
     Location,
     OrderStatus,
@@ -29,19 +31,17 @@ from app.domain.models import (
 from app.services.exceptions import OrderNotFoundError
 from app.services.order_service import OrderService
 from app.services.ports import UnitOfWorkFactory
-from tests.fakes import InMemoryDatabase, InMemoryUnitOfWork
 
 S = OrderStatus
 DRONE = UUID(int=0xD0)
 
 
-@pytest.fixture(params=["memory", pytest.param("postgres", marks=pytest.mark.integration)])
-def uow_factory(request: pytest.FixtureRequest) -> UnitOfWorkFactory:
-    if request.param == "memory":
-        database = InMemoryDatabase()
-        return lambda: InMemoryUnitOfWork(database)
-    factory: UnitOfWorkFactory = request.getfixturevalue("pg_uow_factory")
-    return factory
+@pytest.fixture(autouse=True)
+async def _the_drone(uow_factory: UnitOfWorkFactory, make_drone: Callable[..., Drone]) -> None:
+    """Orders may only reference registered drones; register ``DRONE`` in either backend."""
+    async with uow_factory() as uow:
+        assert await uow.drones.add(make_drone(id=DRONE, name="dispatch-drone"))
+        await uow.commit()
 
 
 @pytest.fixture

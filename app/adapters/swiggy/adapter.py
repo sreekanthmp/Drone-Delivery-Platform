@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from typing import Any, Final
 
 from app.adapters.base import HTTP_STATUS_FOR_ERROR, ClientError, ClientResponse
-from app.adapters.common import iso, truncate_description, validate_payload
+from app.adapters.common import iso, order_status_of, truncate_description, validate_payload
 from app.adapters.swiggy.schemas import SwiggyOrderPayload
 from app.domain.models import AuditEvent, Location, Order, OrderRequest, OrderStatus, Package
 
@@ -72,7 +72,7 @@ class SwiggyAdapter:
     def render_status_update(self, order: Order, event: AuditEvent) -> Mapping[str, Any]:
         return {
             "swiggy_order_id": order.external_order_id,
-            "event": STATUS_NAMES[event.new_state or order.status],
+            "event": STATUS_NAMES[order_status_of(order, event)],
             "timestamp": iso(event.occurred_at),
             "reference": str(event.event_id),
         }

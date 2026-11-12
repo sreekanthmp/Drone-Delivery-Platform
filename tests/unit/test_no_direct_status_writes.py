@@ -12,7 +12,9 @@ count) and fails if code outside that path:
 * touches the ``OrderRecord`` / ``AuditEventRecord`` table classes,
 * contains raw SQL that writes to the order or audit tables,
 * calls ``Order.rehydrate`` (persistence-only) or ``dataclasses.replace(..., status=...)``,
-* calls the store's write methods (``apply_transition`` / ``orders.insert``).
+* calls a store's write methods (``orders``/``flights`` ``insert`` and ``apply_transition``,
+  ``drones`` ``add`` and ``apply_status_change``) outside the one service allowed to,
+* creates a ``StartAuthorization`` anywhere but the flight state machine (Rule 2's token).
 
 It is a heuristic guard-rail, not a proof: the database triggers are the backstop for
 anything an AST scan cannot see.
@@ -44,15 +46,45 @@ RECORD_CLASS_HOMES: dict[str, set[str]] = {
         "app/db/repositories/audit.py",
         _MIGRATION_ENV,
     },
+    "DroneRecord": {
+        _MODELS,
+        "app/db/models/drone.py",
+        "app/db/repositories/drones.py",
+        _MIGRATION_ENV,
+    },
+    "FlightRecord": {
+        _MODELS,
+        "app/db/models/flight.py",
+        "app/db/repositories/flights.py",
+        _MIGRATION_ENV,
+    },
 }
 REHYDRATE_HOME_PREFIX = "app/db/"
-REPLACE_STATUS_HOMES = {"app/domain/order_state_machine.py"}
-STORE_WRITE_HOMES = {"app/services/order_service.py"}
+# Only these modules may derive an entity with a different status via dataclasses.replace.
+REPLACE_STATUS_HOMES = {
+    "app/domain/order_state_machine.py",
+    "app/domain/flight_state_machine.py",
+    "app/domain/models/drone.py",
+}
+# Who may call each store's write methods. The flight and drone homes are the dispatch
+# service, which arrives in the next phase; until then nothing may call them.
+STORE_WRITE_HOMES: dict[str, set[str]] = {
+    "orders": {"app/services/order_service.py"},
+    "flights": {"app/dispatch/service.py"},
+    "drones": {"app/dispatch/service.py"},
+}
+STORE_WRITE_METHODS: dict[str, set[str]] = {
+    "orders": {"insert", "apply_transition"},
+    "flights": {"insert", "apply_transition"},
+    "drones": {"add", "apply_status_change"},
+}
+# Only the flight state machine may mint the token that authorises a flight to start.
+START_AUTHORIZATION_HOME = "app/domain/flight_state_machine.py"
 SQL_EXEMPT_PREFIX = "app/db/migrations/"
 
 RAW_SQL_WRITE = re.compile(
     r"\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO|TRUNCATE(?:\s+TABLE)?)\s+"
-    r"(orders|audit_events|order_transitions)\b",
+    r"(orders|audit_events|order_transitions|flights|flight_transitions|drones)\b",
     re.IGNORECASE,
 )
 
@@ -134,20 +166,29 @@ def find_violations(source: str, path: str) -> list[str]:
                 violations.append(
                     f"line {node.lineno}: replace(..., status=...) outside the state machine"
                 )
-            # store write methods
-            if isinstance(func, ast.Attribute) and path not in STORE_WRITE_HOMES:
-                if func.attr == "apply_transition":
+            # store write methods: judged by which store they are called on
+            if isinstance(func, ast.Attribute):
+                receiver = func.value.attr if isinstance(func.value, ast.Attribute) else None
+                if receiver in STORE_WRITE_METHODS and func.attr in STORE_WRITE_METHODS[receiver]:
+                    if path not in STORE_WRITE_HOMES[receiver]:
+                        violations.append(
+                            f"line {node.lineno}: calls {receiver}.{func.attr} outside "
+                            f"{sorted(STORE_WRITE_HOMES[receiver])}"
+                        )
+                elif func.attr == "apply_transition" and path not in {
+                    home for homes in STORE_WRITE_HOMES.values() for home in homes
+                }:
+                    # a store reached through some other name: still not allowed
                     violations.append(
-                        f"line {node.lineno}: calls apply_transition outside OrderService"
+                        f"line {node.lineno}: calls apply_transition outside the services"
                     )
-                if (
-                    func.attr == "insert"
-                    and isinstance(func.value, ast.Attribute)
-                    and func.value.attr == "orders"
-                ):
-                    violations.append(
-                        f"line {node.lineno}: calls orders.insert outside OrderService"
-                    )
+            # StartAuthorization(...) may only be created by the flight state machine
+            constructor = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if constructor == "StartAuthorization" and path != START_AUTHORIZATION_HOME:
+                violations.append(
+                    f"line {node.lineno}: creates a StartAuthorization outside the flight "
+                    "state machine"
+                )
 
         # 2. table classes
         if (
@@ -198,6 +239,11 @@ def test_the_scan_covers_the_modules_that_matter() -> None:
         "app/services/order_service.py",
         "app/domain/order_state_machine.py",
         "app/db/migrations/versions/0001_initial_schema.py",
+        "app/db/migrations/versions/0002_drones_and_flights.py",
+        "app/db/repositories/flights.py",
+        "app/db/repositories/drones.py",
+        "app/domain/flight_state_machine.py",
+        "app/domain/models/drone.py",
     } <= names
 
 
@@ -232,6 +278,23 @@ class TestTheDetectorItself:
             ("order = replace(order, status=s)", "app/dispatch/assignment.py"),
             ("await uow.orders.apply_transition(result)", "app/telemetry/mqtt_ingest.py"),
             ("await uow.orders.insert(result)", "app/api/internal/orders.py"),
+            ("await uow.flights.apply_transition(result)", "app/api/internal/flights.py"),
+            ("await uow.flights.insert(result)", "app/services/order_service.py"),
+            ("await uow.flights.apply_transition(r)", "app/telemetry/mqtt_ingest.py"),
+            ("await uow.drones.apply_status_change(a, b)", "app/api/internal/drones.py"),
+            ("await uow.drones.add(drone)", "app/services/order_service.py"),
+            ("await uow.orders.apply_transition(r)", "app/dispatch/service.py"),
+            ("await store.apply_transition(r)", "app/api/internal/orders.py"),
+            ("auth = StartAuthorization(flight_id=f)", "app/dispatch/service.py"),
+            ("auth = flight_state_machine.StartAuthorization(f)", "app/api/internal/flights.py"),
+            ("db.execute('UPDATE flights SET status = 1')", "app/dispatch/service.py"),
+            ("db.execute('DELETE FROM drones')", "app/api/internal/drones.py"),
+            ("db.execute('insert into flight_transitions values (1)')", "app/dispatch/mission.py"),
+            ("from app.db.models import FlightRecord", "app/dispatch/service.py"),
+            ("from app.db.models import DroneRecord", "app/dispatch/assignment.py"),
+            ("flight = Flight.rehydrate(id=1)", "app/dispatch/service.py"),
+            ("drone = replace(drone, status=DroneStatus.AVAILABLE)", "app/dispatch/service.py"),
+            ("flight = replace(flight, status=FlightStatus.STARTED)", "app/dispatch/service.py"),
         ],
     )
     def test_flags_writes_outside_the_blessed_path(self, source: str, path: str) -> None:
@@ -254,6 +317,22 @@ class TestTheDetectorItself:
             ("o = replace(order, status=s)", "app/domain/order_state_machine.py"),
             ("await uow.orders.apply_transition(r)", "app/services/order_service.py"),
             ("await uow.orders.insert(r)", "app/services/order_service.py"),
+            ("await uow.flights.apply_transition(r)", "app/dispatch/service.py"),
+            ("await uow.flights.insert(r)", "app/dispatch/service.py"),
+            ("await uow.drones.apply_status_change(a, b)", "app/dispatch/service.py"),
+            ("await uow.drones.add(drone)", "app/dispatch/service.py"),
+            ("await uow.flights.get(flight_id)", "app/api/internal/flights.py"),
+            ("await uow.flights.list_for_order(order_id)", "app/api/internal/flights.py"),
+            ("await uow.drones.list_available(lock=True)", "app/dispatch/service.py"),
+            ("await uow.drones.get(drone_id)", "app/api/internal/drones.py"),
+            ("session.add(thing)", "app/api/internal/orders.py"),
+            ("items.insert(0, x)", "app/api/internal/orders.py"),
+            ("auth = StartAuthorization(flight_id=f)", "app/domain/flight_state_machine.py"),
+            ("flight = replace(flight, status=target)", "app/domain/flight_state_machine.py"),
+            ("drone = replace(drone, status=target)", "app/domain/models/drone.py"),
+            ("flight = Flight.rehydrate(id=1)", "app/db/repositories/flights.py"),
+            ("db.execute('SELECT * FROM flights')", "app/api/internal/flights.py"),
+            ("db.execute('UPDATE flights SET x = 1')", "app/db/migrations/versions/0003_x.py"),
             ("await uow.orders.get(order_id)", "app/api/internal/orders.py"),
             ("await uow.audit.list_for_order(order_id)", "app/api/ops/dash.py"),
             ("db.execute('SELECT * FROM orders')", "app/api/ops/dash.py"),

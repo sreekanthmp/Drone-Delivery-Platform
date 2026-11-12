@@ -15,7 +15,7 @@ from app.domain.models import EventSource, OrderStatus
 from app.main import create_app
 from app.services.order_service import OrderService
 from tests.api.conftest import PARTNER_STATUS, PLATFORM_REF, create_path, lookup_path
-from tests.integration.conftest import RunSql
+from tests.integration.conftest import RegisterDrone, RunSql
 from tests.payloads import VALID_PAYLOADS, set_path
 
 pytestmark = pytest.mark.integration
@@ -91,8 +91,9 @@ async def test_creation_is_audited_as_an_adapter_event(
 
 
 async def test_the_full_flow_reflects_status_changes_in_each_partners_vocabulary(
-    http: httpx.AsyncClient, real_app: FastAPI
+    http: httpx.AsyncClient, real_app: FastAPI, register_drone: RegisterDrone
 ) -> None:
+    drone = await register_drone(UUID(int=0xD0))
     service: OrderService = real_app.state.order_service
     expected = {
         "mock": ["created", "assigned", "in_flight"],
@@ -105,9 +106,7 @@ async def test_the_full_flow_reflects_status_changes_in_each_partners_vocabulary
         order_id = UUID(PLATFORM_REF[client_id](created.json()))
         seen = [PARTNER_STATUS[client_id]((await http.get(lookup_path(client_id))).json())]
 
-        await service.transition(
-            order_id, S.ASSIGNED, source=EventSource.DISPATCH, drone_id=UUID(int=0xD0)
-        )
+        await service.transition(order_id, S.ASSIGNED, source=EventSource.DISPATCH, drone_id=drone)
         seen.append(PARTNER_STATUS[client_id]((await http.get(lookup_path(client_id))).json()))
         await service.transition(order_id, S.PICKED_UP, source=EventSource.DISPATCH)
         await service.transition(order_id, S.IN_FLIGHT, source=EventSource.TELEMETRY)

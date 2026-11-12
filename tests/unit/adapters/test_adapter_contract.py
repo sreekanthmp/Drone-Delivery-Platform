@@ -153,3 +153,49 @@ class TestEveryAdapter:
             if other.client_id != adapter.client_id
         ]
         assert all(mine != other for other in others)
+
+
+class TestFlightEventsAreNeverRenderedForPartners:
+    """Flight and order statuses share some strings (e.g. "cancelled"); they must not mix."""
+
+    @pytest.mark.parametrize("adapter", ADAPTERS, ids=IDS)
+    def test_a_flight_event_is_refused_loudly(
+        self, adapter: ClientAdapter, make_order: MakeOrder
+    ) -> None:
+        from uuid import UUID
+
+        from app.domain.models import AuditEvent, AuditEventType, EventSource, FlightStatus
+
+        order = make_order(
+            OrderStatus.CREATED,
+            client_id=adapter.client_id,
+            external_order_id=EXTERNAL_IDS[adapter.client_id],
+        )
+        flight_event = AuditEvent(
+            event_id=UUID(int=1),
+            order_id=order.id,
+            event_type=AuditEventType.FLIGHT_STATUS_CHANGED,
+            previous_state=FlightStatus.PLANNED,
+            new_state=FlightStatus.CANCELLED,  # == OrderStatus.CANCELLED as a string
+            occurred_at=order.created_at,
+            source=EventSource.DISPATCH,
+            drone_id=UUID(int=2),
+            flight_id=UUID(int=3),
+        )
+
+        with pytest.raises(ValueError, match="only order status events"):
+            adapter.render_status_update(order, flight_event)
+
+    @pytest.mark.parametrize("adapter", ADAPTERS, ids=IDS)
+    def test_an_event_for_a_different_order_is_refused(
+        self, adapter: ClientAdapter, make_order: MakeOrder
+    ) -> None:
+        order = make_order(
+            OrderStatus.CREATED,
+            client_id=adapter.client_id,
+            external_order_id=EXTERNAL_IDS[adapter.client_id],
+        )
+        other = make_order(OrderStatus.CREATED, id=__import__("uuid").UUID(int=0xBEEF))
+
+        with pytest.raises(ValueError, match="different order"):
+            adapter.render_status_update(order, event_for(other, OrderStatus.CREATED))

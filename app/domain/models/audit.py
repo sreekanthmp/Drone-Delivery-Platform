@@ -16,13 +16,15 @@ from typing import Any
 from uuid import UUID
 
 from app.domain.exceptions import AuditEventValidationError
+from app.domain.models.flight import FlightStatus
 from app.domain.models.order import OrderStatus
 
 
 class AuditEventType(StrEnum):
     ORDER_CREATED = "order_created"
     ORDER_STATUS_CHANGED = "order_status_changed"
-    # Flight event types are added in the dispatch/compliance phase.
+    FLIGHT_CREATED = "flight_created"
+    FLIGHT_STATUS_CHANGED = "flight_status_changed"
 
 
 class EventSource(StrEnum):
@@ -35,6 +37,10 @@ class EventSource(StrEnum):
     WEBHOOK = "webhook"
     OPS = "ops"
     SYSTEM = "system"
+
+
+AuditState = OrderStatus | FlightStatus
+"""Order events use :class:`OrderStatus`; flight events use :class:`FlightStatus`."""
 
 
 def _freeze(value: object, path: str) -> object:
@@ -67,11 +73,12 @@ class AuditEvent:
     event_id: UUID
     order_id: UUID
     event_type: AuditEventType
-    previous_state: OrderStatus | None
-    new_state: OrderStatus | None
+    previous_state: AuditState | None
+    new_state: AuditState | None
     occurred_at: datetime
     source: EventSource
     drone_id: UUID | None = None
+    flight_id: UUID | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -84,16 +91,48 @@ class AuditEvent:
                     raise AuditEventValidationError(
                         "order_created events must go from no state to 'created'"
                     )
+                self._require_no_flight()
             case AuditEventType.ORDER_STATUS_CHANGED:
-                if self.previous_state is None or self.new_state is None:
+                if not (
+                    isinstance(self.previous_state, OrderStatus)
+                    and isinstance(self.new_state, OrderStatus)
+                ):
                     raise AuditEventValidationError(
-                        "order_status_changed events need previous_state and new_state"
+                        "order_status_changed events need an order previous_state and new_state"
                     )
                 if self.previous_state == self.new_state:
                     raise AuditEventValidationError(
                         "order_status_changed events must change the state"
                     )
+                self._require_no_flight()
+            case AuditEventType.FLIGHT_CREATED:
+                if self.previous_state is not None or self.new_state is not FlightStatus.PLANNED:
+                    raise AuditEventValidationError(
+                        "flight_created events must go from no state to 'planned'"
+                    )
+                self._require_flight_and_drone()
+            case AuditEventType.FLIGHT_STATUS_CHANGED:
+                if not (
+                    isinstance(self.previous_state, FlightStatus)
+                    and isinstance(self.new_state, FlightStatus)
+                ):
+                    raise AuditEventValidationError(
+                        "flight_status_changed events need a flight previous_state and new_state"
+                    )
+                if self.previous_state == self.new_state:
+                    raise AuditEventValidationError(
+                        "flight_status_changed events must change the state"
+                    )
+                self._require_flight_and_drone()
 
         if not isinstance(self.metadata, Mapping):
             raise AuditEventValidationError("metadata must be a mapping")
         object.__setattr__(self, "metadata", _freeze(self.metadata, "metadata"))
+
+    def _require_no_flight(self) -> None:
+        if self.flight_id is not None:
+            raise AuditEventValidationError("order events do not belong to a flight")
+
+    def _require_flight_and_drone(self) -> None:
+        if self.flight_id is None or self.drone_id is None:
+            raise AuditEventValidationError("flight events need a flight_id and a drone_id")

@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     log_json: bool = False
 
+    # Only the mock exists: a real Digital Sky integration is not built until requested.
+    compliance_provider: Literal["mock"] = "mock"
+    permission_validity_minutes: int = Field(default=15, ge=1)
+
     @field_validator("database_url")
     @classmethod
     def _require_asyncpg_driver(cls, value: str) -> str:

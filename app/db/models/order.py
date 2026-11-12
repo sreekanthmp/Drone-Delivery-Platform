@@ -4,8 +4,7 @@ Status is plain ``TEXT`` guarded by a ``CHECK`` (easier to migrate than a Postgr
 ENUM). Locations are PostGIS ``geography(Point, 4326)``; note PostGIS orders
 coordinates as (longitude, latitude).
 
-``drone_id`` is a plain UUID for now: the ``drones`` table (and this foreign key)
-arrive with the dispatch phase.
+``drone_id`` references the drone registry (``drones``); the foreign key is ``RESTRICT``.
 
 Lifecycle rules for this table (valid edges, mandatory audit row) are enforced by
 the ``orders_enforce_lifecycle`` constraint trigger created in the migration.
@@ -18,7 +17,16 @@ from typing import Any
 from uuid import UUID
 
 from geoalchemy2 import Geography
-from sqlalchemy import CheckConstraint, DateTime, Double, Index, Text, UniqueConstraint, Uuid
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    Double,
+    ForeignKey,
+    Index,
+    Text,
+    UniqueConstraint,
+    Uuid,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -48,6 +56,8 @@ class OrderRecord(Base):
     package_weight_kg: Mapped[float] = mapped_column(Double)
     package_description: Mapped[str] = mapped_column(Text, server_default="")
     status: Mapped[str] = mapped_column(Text)
-    drone_id: Mapped[UUID | None] = mapped_column(Uuid)
+    drone_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("drones.id", ondelete="RESTRICT")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

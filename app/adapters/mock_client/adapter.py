@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from typing import Any, Final
 
 from app.adapters.base import HTTP_STATUS_FOR_ERROR, ClientError, ClientResponse
-from app.adapters.common import iso, validate_payload
+from app.adapters.common import iso, order_status_of, validate_payload
 from app.adapters.mock_client.schemas import MockOrderPayload
 from app.domain.models import AuditEvent, Location, Order, OrderRequest, OrderStatus, Package
 
@@ -51,7 +51,7 @@ class MockClientAdapter:
     def render_status_update(self, order: Order, event: AuditEvent) -> Mapping[str, Any]:
         return {
             "order_id": order.external_order_id,
-            "status": STATUS_NAMES[event.new_state or order.status],
+            "status": STATUS_NAMES[order_status_of(order, event)],
             "event_id": str(event.event_id),
             "occurred_at": iso(event.occurred_at),
         }

@@ -107,8 +107,8 @@ class TransitionResult:
             )
         if (
             event.event_type is AuditEventType.ORDER_STATUS_CHANGED
-            and event.previous_state is not None
-            and event.new_state is not None
+            and isinstance(event.previous_state, OrderStatus)
+            and isinstance(event.new_state, OrderStatus)
             and event.new_state not in ALLOWED_TRANSITIONS[event.previous_state]
         ):
             raise InvalidTransitionError(event.previous_state, event.new_state)

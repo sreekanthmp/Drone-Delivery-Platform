@@ -27,7 +27,15 @@ async def _names(run_sql: RunSql, query: str) -> set[str]:
 
 async def test_creates_the_expected_tables(run_sql: RunSql) -> None:
     tables = await _names(run_sql, "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
-    assert {"orders", "audit_events", "order_transitions", "alembic_version"} <= tables
+    assert {
+        "orders",
+        "audit_events",
+        "order_transitions",
+        "drones",
+        "flights",
+        "flight_transitions",
+        "alembic_version",
+    } <= tables
 
 
 async def test_postgis_is_enabled(run_sql: RunSql) -> None:
@@ -62,6 +70,9 @@ async def test_all_guard_triggers_exist_and_the_lifecycle_trigger_is_deferred(
         "order_transitions_reject_changes": ("order_transitions", False, False),
         "order_transitions_reject_truncate": ("order_transitions", False, False),
         "orders_enforce_lifecycle": ("orders", True, True),
+        "flight_transitions_reject_changes": ("flight_transitions", False, False),
+        "flight_transitions_reject_truncate": ("flight_transitions", False, False),
+        "flights_enforce_lifecycle": ("flights", True, True),
     }
 
 
@@ -86,10 +97,11 @@ async def test_models_and_migration_agree(engine: AsyncEngine) -> None:
     async with engine.connect() as connection:
         differences = await connection.run_sync(diff)
 
-    # Two tables legitimately exist only in the database: PostGIS's own ``spatial_ref_sys``,
-    # and ``order_transitions``, reference data that is deliberately not an ORM model (only
-    # the migration and the lifecycle trigger touch it). Any other difference is real drift.
-    only_in_database = {"spatial_ref_sys", "order_transitions"}
+    # Three tables legitimately exist only in the database: PostGIS's own ``spatial_ref_sys``,
+    # and ``order_transitions`` / ``flight_transitions``, reference data that is deliberately
+    # not ORM models (only the migrations and the lifecycle triggers touch them). Any other
+    # difference is real drift.
+    only_in_database = {"spatial_ref_sys", "order_transitions", "flight_transitions"}
     removed = {d[1].name for d in differences if d[0] == "remove_table"}
     unexpected = [
         d for d in differences if not (d[0] == "remove_table" and d[1].name in only_in_database)
@@ -123,11 +135,21 @@ async def test_downgrade_removes_everything_and_upgrade_restores_it(
 
     await asyncio.to_thread(command.downgrade, config, "base")
     tables = await _names(run_sql, "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
-    assert not {"orders", "audit_events", "order_transitions"} & tables
+    assert (
+        not {
+            "orders",
+            "audit_events",
+            "order_transitions",
+            "drones",
+            "flights",
+            "flight_transitions",
+        }
+        & tables
+    )
     functions = await _names(
         run_sql,
         "SELECT proname FROM pg_proc WHERE proname IN"
-        " ('reject_row_mutation', 'orders_enforce_lifecycle')",
+        " ('reject_row_mutation', 'orders_enforce_lifecycle', 'flights_enforce_lifecycle')",
     )
     assert functions == set()
 

@@ -8,6 +8,9 @@ Layers and what each may import (besides the standard library):
 ``app/services``      ``structlog``, ``app.domain``, ``app.services``
 ``app/db``            SQLAlchemy/GeoAlchemy2/Alembic, ``app.domain``, ``app.services``,
                       ``app.db``, ``app.config``
+``app/compliance``    ``app.domain``, ``app.compliance``
+``app/dispatch``      structlog, ``app.domain``, ``app.compliance``, ``app.services``,
+                      ``app.dispatch``
 ``app/api``           FastAPI/Starlette/Pydantic/structlog, ``app.domain``,
                       ``app.services``, ``app.adapters``, ``app.api``
 ====================  ==============================================================
@@ -46,6 +49,14 @@ RULES: dict[str, LayerRule] = {
     "app/db": LayerRule(
         frozenset({"sqlalchemy", "geoalchemy2", "alembic"}),
         frozenset({"app.domain", "app.services", "app.db", "app.config"}),
+    ),
+    # The compliance interface and its mock know only the domain.
+    "app/compliance": LayerRule(frozenset(), frozenset({"app.domain", "app.compliance"})),
+    # Dispatch logic: the domain, the compliance interface and the service ports. Never the
+    # database layer, the HTTP layer or the partner adapters.
+    "app/dispatch": LayerRule(
+        frozenset({"structlog"}),
+        frozenset({"app.domain", "app.compliance", "app.services", "app.dispatch"}),
     ),
     "app/api": LayerRule(
         frozenset({"fastapi", "starlette", "pydantic", "structlog"}),
@@ -172,6 +183,43 @@ class TestTheDetectorItself:
     )
     def test_allows_legitimate_adapter_imports(self, source: str) -> None:
         assert find_boundary_violations(source, self.ADAPTERS) == []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from app.db.session import create_engine",
+            "from app.db.uow import SqlAlchemyUnitOfWork",
+            "from app.api.deps import OrderServiceDep",
+            "from app.adapters.swiggy import SwiggyAdapter",
+            "import sqlalchemy",
+            "import fastapi",
+            "import paho.mqtt.client",
+            "from app.compliance.mock_digital_sky import MockDigitalSky\nimport httpx",
+        ],
+    )
+    def test_flags_dispatch_reaching_the_edges(self, source: str) -> None:
+        assert find_boundary_violations(source, RULES["app/dispatch"]) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from app.services.order_service import OrderService",
+            "from app.dispatch.assignment import select_drone",
+            "import structlog",
+            "from app.db.models import DroneRecord",
+        ],
+    )
+    def test_flags_the_compliance_package_reaching_beyond_the_domain(self, source: str) -> None:
+        assert find_boundary_violations(source, RULES["app/compliance"]) != []
+
+    def test_allows_dispatch_to_use_the_domain_compliance_and_service_ports(self) -> None:
+        source = (
+            "from app.domain.models import Drone\n"
+            "from app.compliance.interface import ComplianceProvider\n"
+            "from app.services.ports import UnitOfWorkFactory\n"
+            "import structlog\n"
+        )
+        assert find_boundary_violations(source, RULES["app/dispatch"]) == []
 
     def test_allows_the_api_to_use_services_adapters_and_fastapi(self) -> None:
         source = (

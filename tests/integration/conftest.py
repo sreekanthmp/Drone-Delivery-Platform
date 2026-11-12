@@ -23,6 +23,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import asyncpg
 import pytest
@@ -38,6 +39,8 @@ from app.db.uow import SqlAlchemyUnitOfWork
 from app.domain.models import EventSource, Location, Order, Package
 from app.services.order_service import OrderService
 from app.services.ports import UnitOfWorkFactory
+from tests.conftest import DRONE_ID, build_drone
+from tests.fakes import InMemoryDatabase, InMemoryUnitOfWork
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ADMIN_DSN = os.environ.get(
@@ -118,6 +121,16 @@ def pg_uow_factory(session_factory: async_sessionmaker[AsyncSession]) -> UnitOfW
     return lambda: SqlAlchemyUnitOfWork(session_factory)
 
 
+@pytest.fixture(params=["memory", pytest.param("postgres", marks=pytest.mark.integration)])
+def uow_factory(request: pytest.FixtureRequest) -> UnitOfWorkFactory:
+    """The same tests against the in-memory fake and the real PostgreSQL implementation."""
+    if request.param == "memory":
+        database = InMemoryDatabase()
+        return lambda: InMemoryUnitOfWork(database)
+    factory: UnitOfWorkFactory = request.getfixturevalue("pg_uow_factory")
+    return factory
+
+
 @pytest.fixture
 def pg_service(pg_uow_factory: UnitOfWorkFactory) -> OrderService:
     return OrderService(pg_uow_factory)
@@ -137,6 +150,23 @@ async def created_order(
         source=EventSource.API,
     )
     return result.order
+
+
+RegisterDrone = Callable[..., Awaitable[UUID]]
+
+
+@pytest.fixture
+def register_drone(pg_uow_factory: UnitOfWorkFactory) -> RegisterDrone:
+    """Register a drone in the database (orders may only reference registered drones)."""
+
+    async def _register(drone_id: UUID = DRONE_ID, **overrides: Any) -> UUID:
+        overrides.setdefault("name", f"drone-{drone_id.hex[-12:]}")
+        async with pg_uow_factory() as uow:
+            assert await uow.drones.add(build_drone(id=drone_id, **overrides))
+            await uow.commit()
+        return drone_id
+
+    return _register
 
 
 RunTx = Callable[..., Awaitable[None]]

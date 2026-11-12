@@ -28,6 +28,8 @@ class TestDefaults:
         assert settings.database_max_overflow == 10
         assert settings.log_level == "INFO"
         assert settings.log_json is False
+        assert settings.compliance_provider == "mock"
+        assert settings.permission_validity_minutes == 15
 
 
 class TestEnvironmentOverrides:
@@ -54,6 +56,30 @@ class TestEnvironmentOverrides:
         settings = Settings(_env_file=env_file)  # type: ignore[call-arg]
 
         assert settings.log_level == "ERROR"
+
+
+class TestCompliance:
+    def test_the_provider_and_validity_come_from_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COMPLIANCE_PROVIDER", "mock")
+        monkeypatch.setenv("PERMISSION_VALIDITY_MINUTES", "45")
+
+        settings = make()
+
+        assert settings.compliance_provider == "mock"
+        assert settings.permission_validity_minutes == 45
+
+    @pytest.mark.parametrize("provider", ["digital_sky", "real", "", "MOCK"])
+    def test_only_the_mock_provider_exists(self, provider: str) -> None:
+        """A real Digital Sky integration is not built until it is explicitly requested."""
+        with pytest.raises(ValidationError):
+            make(compliance_provider=provider)
+
+    @pytest.mark.parametrize("minutes", ["0", "-5"])
+    def test_the_validity_must_be_positive(self, minutes: str) -> None:
+        with pytest.raises(ValidationError):
+            make(permission_validity_minutes=minutes)
 
 
 class TestValidation:

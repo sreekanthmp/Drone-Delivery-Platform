@@ -11,46 +11,28 @@ from __future__ import annotations
 from typing import Any, cast
 from uuid import UUID
 
-from geoalchemy2 import Geography, Geometry
-from geoalchemy2.functions import ST_X, ST_Y
-from sqlalchemy import ColumnElement, CursorResult, func, select, update
-from sqlalchemy import cast as sql_cast
+from sqlalchemy import CursorResult, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import OrderRecord
 from app.db.repositories.audit import SqlAlchemyAuditLog
+from app.db.spatial import latitude_of, longitude_of, point
 from app.domain.models import AuditEventType, Location, Order, OrderStatus, Package
 from app.domain.order_state_machine import TransitionResult
 from app.services.exceptions import ConcurrentUpdateError
 
-_SRID = 4326
-
-
-def point(location: Location) -> ColumnElement[Any]:
-    """SQL expression for a WGS84 geography point. PostGIS takes (longitude, latitude)."""
-    return sql_cast(
-        func.ST_SetSRID(func.ST_MakePoint(location.longitude, location.latitude), _SRID),
-        Geography("POINT", srid=_SRID),
-    )
-
 
 def _order_select() -> Any:
-    def lon(column: Any) -> Any:
-        return ST_X(sql_cast(column, Geometry("POINT", srid=_SRID)))
-
-    def lat(column: Any) -> Any:
-        return ST_Y(sql_cast(column, Geometry("POINT", srid=_SRID)))
-
     return select(
         OrderRecord.id,
         OrderRecord.client_id,
         OrderRecord.external_order_id,
-        lon(OrderRecord.pickup).label("pickup_lon"),
-        lat(OrderRecord.pickup).label("pickup_lat"),
-        lon(OrderRecord.dropoff).label("dropoff_lon"),
-        lat(OrderRecord.dropoff).label("dropoff_lat"),
+        longitude_of(OrderRecord.pickup).label("pickup_lon"),
+        latitude_of(OrderRecord.pickup).label("pickup_lat"),
+        longitude_of(OrderRecord.dropoff).label("dropoff_lon"),
+        latitude_of(OrderRecord.dropoff).label("dropoff_lat"),
         OrderRecord.package_weight_kg,
         OrderRecord.package_description,
         OrderRecord.status,

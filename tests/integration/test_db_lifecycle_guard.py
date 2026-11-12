@@ -16,7 +16,7 @@ from sqlalchemy.exc import DBAPIError
 
 from app.domain.models import EventSource, Location, Order, OrderStatus, Package
 from app.services.order_service import OrderService
-from tests.integration.conftest import RunSql, RunTx
+from tests.integration.conftest import RegisterDrone, RunSql, RunTx
 
 pytestmark = pytest.mark.integration
 
@@ -93,12 +93,14 @@ class TestStatusChangesNeedTheStateMachinesBlessing:
         package: Package,
         run_sql: RunSql,
         run_tx: RunTx,
+        register_drone: RegisterDrone,
     ) -> None:
         """Order A legitimately goes created -> assigned, leaving a matching audit row.
 
         A raw update moving order B through the same edge must still be refused: the audit
         event has to belong to *that* order.
         """
+        await register_drone(DRONE)
         other = (
             await pg_service.create_order(
                 client_id="mock",

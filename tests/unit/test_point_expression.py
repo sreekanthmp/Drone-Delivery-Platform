@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy.dialects import postgresql
 
-from app.db.repositories.orders import point
+from app.db.spatial import point
 from app.domain.models import Location
 
 

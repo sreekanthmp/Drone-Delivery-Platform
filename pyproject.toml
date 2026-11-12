@@ -49,6 +49,10 @@ src = ["."]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "C4", "PT"]
 
+[tool.ruff.lint.per-file-ignores]
+# SQL text in migrations (trigger bodies, error messages) cannot be wrapped sensibly.
+"app/db/migrations/versions/*" = ["E501"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
