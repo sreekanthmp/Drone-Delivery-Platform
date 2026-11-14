@@ -3,7 +3,9 @@
 This module and the migration are the only places allowed to write order rows.
 The write methods accept a :class:`TransitionResult` and nothing else, so a status
 can only be stored if the state machine produced it, and its audit event is
-written in the same transaction.
+written in the same transaction. So is the notification owed to the partner (Phase 6): the
+webhook delivery is queued by the same call that writes the audit event, so an order change
+cannot exist without it.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import OrderRecord
 from app.db.repositories.audit import SqlAlchemyAuditLog
+from app.db.repositories.webhooks import SqlAlchemyWebhookStore
 from app.db.spatial import latitude_of, longitude_of, point
 from app.domain.models import AuditEventType, Location, Order, OrderStatus, Package
 from app.domain.order_state_machine import TransitionResult
@@ -58,9 +61,12 @@ def _to_domain(row: Row[Any]) -> Order:
 
 
 class SqlAlchemyOrderStore:
-    def __init__(self, session: AsyncSession, audit: SqlAlchemyAuditLog) -> None:
+    def __init__(
+        self, session: AsyncSession, audit: SqlAlchemyAuditLog, webhooks: SqlAlchemyWebhookStore
+    ) -> None:
         self._session = session
         self._audit = audit
+        self._webhooks = webhooks
 
     async def get(self, order_id: UUID, *, for_update: bool = False) -> Order | None:
         statement = _order_select().where(OrderRecord.id == order_id)
@@ -103,6 +109,7 @@ class SqlAlchemyOrderStore:
         if inserted_id is None:
             return False
         await self._audit.append(event)
+        await self._webhooks.add(event, order.client_id)
         return True
 
     async def apply_transition(self, result: TransitionResult) -> None:
@@ -132,3 +139,4 @@ class SqlAlchemyOrderStore:
                 f"order {order.id} was not in state '{event.previous_state}' when updated"
             )
         await self._audit.append(event)
+        await self._webhooks.add(event, order.client_id)

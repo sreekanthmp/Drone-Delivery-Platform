@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from alembic import command
+from alembic.script import ScriptDirectory
 
 from app.domain.flight_state_machine import ALLOWED_FLIGHT_TRANSITIONS
 from app.domain.models import FlightStatus, Order
@@ -16,6 +17,13 @@ from tests.integration.conftest import RegisterDrone, RunSql, RunTx, alembic_con
 from tests.integration.flights import FlightFlow
 
 pytestmark = pytest.mark.integration
+
+
+def head_revision(database_url: str) -> str:
+    """The newest migration: these tests start from it, so they do not name it."""
+    head = ScriptDirectory.from_config(alembic_config(database_url)).get_current_head()
+    assert head is not None
+    return head
 
 
 async def test_the_flight_edge_table_matches_the_python_state_machine(run_sql: RunSql) -> None:
@@ -110,7 +118,9 @@ async def test_the_downgrade_refuses_to_delete_flight_audit_events(
         await asyncio.to_thread(command.downgrade, alembic_config(database_url), "0001")
 
     # The refused migration changed nothing.
-    assert (await run_sql("SELECT version_num FROM alembic_version"))[0][0] == "0002"
+    assert (await run_sql("SELECT version_num FROM alembic_version"))[0][0] == head_revision(
+        database_url
+    )
     assert (await run_sql("SELECT count(*) FROM audit_events"))[0][0] == events_before
     assert (await run_sql("SELECT status FROM flights WHERE id = :id", id=flight.id))[0][
         0
@@ -185,4 +195,6 @@ async def test_the_upgrade_refuses_orders_that_reference_unregistered_drones(
     # Clearing the stray reference lets the migration through.
     await run_sql("UPDATE orders SET drone_id = NULL")
     await asyncio.to_thread(command.upgrade, config, "head")
-    assert (await run_sql("SELECT version_num FROM alembic_version"))[0][0] == "0002"
+    assert (await run_sql("SELECT version_num FROM alembic_version"))[0][0] == head_revision(
+        database_url
+    )

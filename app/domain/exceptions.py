@@ -156,3 +156,7 @@ class PermissionWindowTooShortError(FlightPermissionError):
 
 class PermissionCheckStaleError(FlightPermissionError):
     """The compliance re-check is too old (or missing) to rely on."""
+
+
+class WebhookDeliveryError(DomainError):
+    """A webhook delivery is malformed, or the requested change is not allowed for it."""

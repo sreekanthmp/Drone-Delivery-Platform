@@ -34,6 +34,8 @@ async def test_creates_the_expected_tables(run_sql: RunSql) -> None:
         "drones",
         "flights",
         "flight_transitions",
+        "webhook_deliveries",
+        "webhook_attempts",
         "alembic_version",
     } <= tables
 
@@ -73,6 +75,8 @@ async def test_all_guard_triggers_exist_and_the_lifecycle_trigger_is_deferred(
         "flight_transitions_reject_changes": ("flight_transitions", False, False),
         "flight_transitions_reject_truncate": ("flight_transitions", False, False),
         "flights_enforce_lifecycle": ("flights", True, True),
+        "webhook_attempts_reject_update_delete": ("webhook_attempts", False, False),
+        "webhook_attempts_reject_truncate": ("webhook_attempts", False, False),
     }
 
 

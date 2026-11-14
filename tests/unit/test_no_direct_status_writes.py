@@ -58,6 +58,18 @@ RECORD_CLASS_HOMES: dict[str, set[str]] = {
         "app/db/repositories/flights.py",
         _MIGRATION_ENV,
     },
+    "WebhookDeliveryRecord": {
+        _MODELS,
+        "app/db/models/webhook.py",
+        "app/db/repositories/webhooks.py",
+        _MIGRATION_ENV,
+    },
+    "WebhookAttemptRecord": {
+        _MODELS,
+        "app/db/models/webhook.py",
+        "app/db/repositories/webhooks.py",
+        _MIGRATION_ENV,
+    },
 }
 REHYDRATE_HOME_PREFIX = "app/db/"
 # Only these modules may derive an entity with a different status via dataclasses.replace.
@@ -65,18 +77,35 @@ REPLACE_STATUS_HOMES = {
     "app/domain/order_state_machine.py",
     "app/domain/flight_state_machine.py",
     "app/domain/models/drone.py",
+    # A webhook delivery has its own status (pending, delivered, failed, skipped). It is not an
+    # order status, and the delivery model is the only place that changes it.
+    "app/domain/models/webhook.py",
 }
 # Who may call each store's write methods: the order service for orders, and the dispatch
 # service for flights and drones (it is the only code that may write them).
+# Webhook deliveries are queued only by the order stores (in the transaction that writes the
+# order's audit event, so a change cannot exist without its notification) and claimed and
+# recorded only by the sender and the webhook service. ``_webhooks`` is how the order stores
+# reach their own webhook store.
+_WEBHOOK_WRITERS = {
+    "app/db/repositories/orders.py",
+    "app/services/memory.py",
+    "app/webhooks/sender.py",
+    "app/services/webhook_service.py",
+}
 STORE_WRITE_HOMES: dict[str, set[str]] = {
     "orders": {"app/services/order_service.py"},
     "flights": {"app/dispatch/service.py"},
     "drones": {"app/dispatch/service.py"},
+    "webhooks": _WEBHOOK_WRITERS,
+    "_webhooks": _WEBHOOK_WRITERS,
 }
 STORE_WRITE_METHODS: dict[str, set[str]] = {
     "orders": {"insert", "apply_transition"},
     "flights": {"insert", "apply_transition"},
     "drones": {"add", "apply_status_change", "set_battery"},
+    "webhooks": {"add", "claim_due", "apply"},
+    "_webhooks": {"add", "claim_due", "apply"},
 }
 # Only the flight state machine may mint the token that authorises a flight to start.
 START_AUTHORIZATION_HOME = "app/domain/flight_state_machine.py"
@@ -84,7 +113,8 @@ SQL_EXEMPT_PREFIX = "app/db/migrations/"
 
 RAW_SQL_WRITE = re.compile(
     r"\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO|TRUNCATE(?:\s+TABLE)?)\s+"
-    r"(orders|audit_events|order_transitions|flights|flight_transitions|drones)\b",
+    r"(orders|audit_events|order_transitions|flights|flight_transitions|drones"
+    r"|webhook_deliveries|webhook_attempts)\b",
     re.IGNORECASE,
 )
 
@@ -244,6 +274,10 @@ def test_the_scan_covers_the_modules_that_matter() -> None:
         "app/db/repositories/drones.py",
         "app/domain/flight_state_machine.py",
         "app/domain/models/drone.py",
+        "app/db/migrations/versions/0003_webhook_deliveries.py",
+        "app/db/repositories/webhooks.py",
+        "app/domain/models/webhook.py",
+        "app/webhooks/sender.py",
     } <= names
 
 
@@ -295,6 +329,17 @@ class TestTheDetectorItself:
             ("flight = Flight.rehydrate(id=1)", "app/dispatch/service.py"),
             ("drone = replace(drone, status=DroneStatus.AVAILABLE)", "app/dispatch/service.py"),
             ("flight = replace(flight, status=FlightStatus.STARTED)", "app/dispatch/service.py"),
+            ("await uow.webhooks.add(event, client_id)", "app/api/internal/orders.py"),
+            (
+                "await uow.webhooks.claim_due(now=n, lease_until=n, limit=1)",
+                "app/dispatch/service.py",
+            ),
+            ("await uow.webhooks.apply(a, b, None)", "app/telemetry/ingest.py"),
+            ("await self._webhooks.add(event, client_id)", "app/dispatch/service.py"),
+            ("from app.db.models import WebhookDeliveryRecord", "app/api/internal/webhooks.py"),
+            ("db.execute('DELETE FROM webhook_attempts')", "app/webhooks/sender.py"),
+            ("db.execute('update webhook_deliveries set status = 1')", "app/api/x.py"),
+            ("d = replace(delivery, status=DeliveryStatus.DELIVERED)", "app/webhooks/sender.py"),
         ],
     )
     def test_flags_writes_outside_the_blessed_path(self, source: str, path: str) -> None:
@@ -337,6 +382,21 @@ class TestTheDetectorItself:
             ("await uow.audit.list_for_order(order_id)", "app/api/ops/dash.py"),
             ("db.execute('SELECT * FROM orders')", "app/api/ops/dash.py"),
             ("db.execute('SELECT * FROM audit_events')", "app/api/ops/dash.py"),
+            ("await self._webhooks.add(event, client_id)", "app/db/repositories/orders.py"),
+            ("await self._webhooks.add(event, client_id)", "app/services/memory.py"),
+            (
+                "await uow.webhooks.claim_due(now=n, lease_until=n, limit=1)",
+                "app/webhooks/sender.py",
+            ),
+            ("await uow.webhooks.apply(a, b, None)", "app/webhooks/sender.py"),
+            ("await uow.webhooks.get(event_id)", "app/api/internal/webhooks.py"),
+            ("await uow.webhooks.list_recent(limit=10)", "app/api/internal/webhooks.py"),
+            (
+                "d = replace(delivery, status=DeliveryStatus.PENDING)",
+                "app/domain/models/webhook.py",
+            ),
+            ("x = WebhookDeliveryRecord", "app/db/repositories/webhooks.py"),
+            ("db.execute('SELECT * FROM webhook_deliveries')", "app/api/internal/webhooks.py"),
         ],
     )
     def test_allows_legitimate_code(self, source: str, path: str) -> None:

@@ -15,7 +15,16 @@ from typing import Protocol, Self
 from uuid import UUID
 
 from app.domain.flight_state_machine import FlightTransitionResult
-from app.domain.models import AuditEvent, Drone, DroneStatus, Flight, Order
+from app.domain.models import (
+    AuditEvent,
+    DeliveryAttempt,
+    DeliveryStatus,
+    Drone,
+    DroneStatus,
+    Flight,
+    Order,
+    WebhookDelivery,
+)
 from app.domain.order_state_machine import TransitionResult
 
 
@@ -45,6 +54,8 @@ class OrderStore(Protocol):
 
 class AuditLog(Protocol):
     """Read access to the append-only audit trail."""
+
+    async def get(self, event_id: UUID) -> AuditEvent | None: ...
 
     async def list_for_order(self, order_id: UUID) -> list[AuditEvent]:
         """All events for an order (order and flight events), oldest first."""
@@ -122,6 +133,64 @@ class FlightStore(Protocol):
         ...
 
 
+class WebhookStore(Protocol):
+    """Webhook deliveries (Phase 6): the queue of notifications owed to partners.
+
+    ``add`` is called only by the order stores, in the same transaction as the order's audit
+    event, so an order change cannot exist without its notification. The sender claims due
+    deliveries and records what happened; nothing here changes an order.
+    """
+
+    async def add(self, event: AuditEvent, client_id: str) -> bool:
+        """Queue the notification for an order audit event.
+
+        Returns ``False`` (storing nothing) if that event is already queued.
+        """
+        ...
+
+    async def claim_due(
+        self, *, now: datetime, lease_until: datetime, limit: int
+    ) -> list[WebhookDelivery]:
+        """Claim up to ``limit`` deliveries that are due, oldest first, until ``lease_until``.
+
+        Due means pending, ``next_attempt_at`` reached, not leased by someone else, and no
+        earlier delivery of the same order (to the same client) still pending: an order's
+        updates go out in order. A delivery another transaction has locked is skipped, so
+        concurrent senders claim different ones.
+        """
+        ...
+
+    async def apply(
+        self, before: WebhookDelivery, after: WebhookDelivery, attempt: DeliveryAttempt | None
+    ) -> bool:
+        """Store ``after`` (and the attempt, if one was made), if the delivery is still ``before``.
+
+        Compare-and-set on the status and the attempt count. Returns ``False`` (storing
+        nothing) when something else changed it first, for example a sender whose lease expired.
+        """
+        ...
+
+    async def get(self, event_id: UUID) -> WebhookDelivery | None: ...
+
+    async def list_recent(
+        self,
+        *,
+        status: DeliveryStatus | None = None,
+        client_id: str | None = None,
+        limit: int = 100,
+    ) -> list[WebhookDelivery]:
+        """Deliveries, newest first, optionally of one status and/or one client."""
+        ...
+
+    async def list_for_order(self, order_id: UUID) -> list[WebhookDelivery]:
+        """Every delivery of an order, oldest first."""
+        ...
+
+    async def attempts_for(self, event_id: UUID) -> list[DeliveryAttempt]:
+        """Every HTTP attempt at a delivery, oldest first."""
+        ...
+
+
 class UnitOfWork(Protocol):
     """One transaction. Leaving the block without ``commit()`` rolls everything back."""
 
@@ -138,6 +207,9 @@ class UnitOfWork(Protocol):
 
     @property
     def flights(self) -> FlightStore: ...
+
+    @property
+    def webhooks(self) -> WebhookStore: ...
 
     async def __aenter__(self) -> Self: ...
 

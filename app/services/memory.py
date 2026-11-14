@@ -13,7 +13,7 @@ the process, and it has none of the database's own guards (the lifecycle trigger
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from types import TracebackType
 from typing import Self
@@ -23,11 +23,14 @@ from app.domain.flight_state_machine import FlightTransitionResult
 from app.domain.models import (
     AuditEvent,
     AuditEventType,
+    DeliveryAttempt,
+    DeliveryStatus,
     Drone,
     DroneStatus,
     Flight,
     FlightStatus,
     Order,
+    WebhookDelivery,
 )
 from app.domain.models.drone import check_status_change
 from app.domain.order_state_machine import TransitionResult
@@ -40,13 +43,100 @@ class InMemoryDatabase:
     audit: list[AuditEvent] = field(default_factory=list)
     drones: dict[UUID, Drone] = field(default_factory=dict)
     flights: dict[UUID, Flight] = field(default_factory=dict)
+    deliveries: dict[UUID, WebhookDelivery] = field(default_factory=dict)
+    delivery_attempts: list[DeliveryAttempt] = field(default_factory=list)
     commits: int = 0
 
 
+class _WebhookStore:
+    def __init__(
+        self, deliveries: dict[UUID, WebhookDelivery], attempts: list[DeliveryAttempt]
+    ) -> None:
+        self._deliveries = deliveries
+        self._attempts = attempts
+
+    async def add(self, event: AuditEvent, client_id: str) -> bool:
+        if event.event_id in self._deliveries:
+            return False
+        delivery = WebhookDelivery.queue(event, client_id)
+        self._deliveries[event.event_id] = replace(delivery, seq=len(self._deliveries) + 1)
+        return True
+
+    async def claim_due(
+        self, *, now: datetime, lease_until: datetime, limit: int
+    ) -> list[WebhookDelivery]:
+        pending = sorted(
+            (d for d in self._deliveries.values() if d.status is DeliveryStatus.PENDING),
+            key=lambda d: d.seq or 0,
+        )
+        claimed: list[WebhookDelivery] = []
+        for delivery in pending:
+            if len(claimed) >= limit:
+                break
+            if delivery.next_attempt_at > now:
+                continue
+            if delivery.lease_until is not None and delivery.lease_until > now:
+                continue
+            # An order's updates go out one at a time, oldest first.
+            if any(
+                earlier.order_id == delivery.order_id
+                and earlier.client_id == delivery.client_id
+                and (earlier.seq or 0) < (delivery.seq or 0)
+                for earlier in pending
+            ):
+                continue
+            taken = delivery.claimed(until=lease_until, now=now)
+            self._deliveries[delivery.event_id] = taken
+            claimed.append(taken)
+        return claimed
+
+    async def apply(
+        self, before: WebhookDelivery, after: WebhookDelivery, attempt: DeliveryAttempt | None
+    ) -> bool:
+        current = self._deliveries.get(before.event_id)
+        if current is None or current.status is not before.status:
+            return False
+        if current.attempts != before.attempts:
+            return False
+        self._deliveries[before.event_id] = replace(after, seq=current.seq)
+        if attempt is not None:
+            self._attempts.append(attempt)
+        return True
+
+    async def get(self, event_id: UUID) -> WebhookDelivery | None:
+        return self._deliveries.get(event_id)
+
+    async def list_recent(
+        self,
+        *,
+        status: DeliveryStatus | None = None,
+        client_id: str | None = None,
+        limit: int = 100,
+    ) -> list[WebhookDelivery]:
+        matching = [
+            d
+            for d in self._deliveries.values()
+            if (status is None or d.status is status)
+            and (client_id is None or d.client_id == client_id)
+        ]
+        return sorted(matching, key=lambda d: d.seq or 0, reverse=True)[:limit]
+
+    async def list_for_order(self, order_id: UUID) -> list[WebhookDelivery]:
+        mine = [d for d in self._deliveries.values() if d.order_id == order_id]
+        return sorted(mine, key=lambda d: d.seq or 0)
+
+    async def attempts_for(self, event_id: UUID) -> list[DeliveryAttempt]:
+        mine = [a for a in self._attempts if a.event_id == event_id]
+        return sorted(mine, key=lambda a: a.attempt_no)
+
+
 class _OrderStore:
-    def __init__(self, orders: dict[UUID, Order], audit: list[AuditEvent]) -> None:
+    def __init__(
+        self, orders: dict[UUID, Order], audit: list[AuditEvent], webhooks: _WebhookStore
+    ) -> None:
         self._orders = orders
         self._audit = audit
+        self._webhooks = webhooks
 
     async def get(self, order_id: UUID, *, for_update: bool = False) -> Order | None:
         return self._orders.get(order_id)
@@ -69,6 +159,7 @@ class _OrderStore:
             return False
         self._orders[order.id] = order
         self._audit.append(result.audit_event)
+        await self._webhooks.add(result.audit_event, order.client_id)
         return True
 
     async def apply_transition(self, result: TransitionResult) -> None:
@@ -80,11 +171,15 @@ class _OrderStore:
             raise ConcurrentUpdateError(f"order {order.id} is not in state {event.previous_state}")
         self._orders[order.id] = order
         self._audit.append(event)
+        await self._webhooks.add(event, order.client_id)
 
 
 class _AuditLog:
     def __init__(self, audit: list[AuditEvent]) -> None:
         self._audit = audit
+
+    async def get(self, event_id: UUID) -> AuditEvent | None:
+        return next((event for event in self._audit if event.event_id == event_id), None)
 
     async def list_for_order(self, order_id: UUID) -> list[AuditEvent]:
         return [event for event in self._audit if event.order_id == order_id]
@@ -195,6 +290,7 @@ class InMemoryUnitOfWork:
     audit: _AuditLog
     drones: _DroneStore
     flights: _FlightStore
+    webhooks: _WebhookStore
 
     def __init__(self, database: InMemoryDatabase) -> None:
         self._database = database
@@ -202,13 +298,18 @@ class InMemoryUnitOfWork:
         self._staged_audit: list[AuditEvent] = []
         self._staged_drones: dict[UUID, Drone] = {}
         self._staged_flights: dict[UUID, Flight] = {}
+        self._staged_deliveries: dict[UUID, WebhookDelivery] = {}
+        self._staged_attempts: list[DeliveryAttempt] = []
 
     async def __aenter__(self) -> Self:
         self._staged_orders = dict(self._database.orders)
         self._staged_audit = list(self._database.audit)
         self._staged_drones = dict(self._database.drones)
         self._staged_flights = dict(self._database.flights)
-        self.orders = _OrderStore(self._staged_orders, self._staged_audit)
+        self._staged_deliveries = dict(self._database.deliveries)
+        self._staged_attempts = list(self._database.delivery_attempts)
+        self.webhooks = _WebhookStore(self._staged_deliveries, self._staged_attempts)
+        self.orders = _OrderStore(self._staged_orders, self._staged_audit, self.webhooks)
         self.audit = _AuditLog(self._staged_audit)
         self.drones = _DroneStore(self._staged_drones)
         self.flights = _FlightStore(self._staged_flights, self._staged_audit)
@@ -225,10 +326,14 @@ class InMemoryUnitOfWork:
         self._staged_audit = []
         self._staged_drones = {}
         self._staged_flights = {}
+        self._staged_deliveries = {}
+        self._staged_attempts = []
 
     async def commit(self) -> None:
         self._database.orders = dict(self._staged_orders)
         self._database.audit = list(self._staged_audit)
         self._database.drones = dict(self._staged_drones)
         self._database.flights = dict(self._staged_flights)
+        self._database.deliveries = dict(self._staged_deliveries)
+        self._database.delivery_attempts = list(self._staged_attempts)
         self._database.commits += 1

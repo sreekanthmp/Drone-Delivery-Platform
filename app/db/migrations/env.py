@@ -17,6 +17,8 @@ from app.db.models import (  # noqa: F401 - registers the tables
     DroneRecord,
     FlightRecord,
     OrderRecord,
+    WebhookAttemptRecord,
+    WebhookDeliveryRecord,
 )
 
 config = context.config

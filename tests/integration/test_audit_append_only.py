@@ -52,8 +52,13 @@ class TestAuditEventsCannotBeChanged:
     async def test_truncate_is_rejected(self, created_order: Order, run_sql: RunSql) -> None:
         before = await _audit_snapshot(run_sql)
 
-        with pytest.raises(DBAPIError, match="TRUNCATE on table audit_events is not allowed"):
+        # Webhook deliveries reference the audit log, so a plain TRUNCATE is refused by the foreign
+        # key before the trigger runs; CASCADE (what someone wiping the log would have to write)
+        # gets as far as the append-only trigger, which is what this test is about.
+        with pytest.raises(DBAPIError, match="cannot truncate a table referenced"):
             await run_sql("TRUNCATE audit_events")
+        with pytest.raises(DBAPIError, match="TRUNCATE on table audit_events is not allowed"):
+            await run_sql("TRUNCATE audit_events CASCADE")
         with pytest.raises(DBAPIError):
             await run_sql("TRUNCATE orders CASCADE")  # cascades into audit_events
 

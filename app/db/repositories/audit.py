@@ -79,6 +79,10 @@ class SqlAlchemyAuditLog:
             )
         )
 
+    async def get(self, event_id: UUID) -> AuditEvent | None:
+        record = await self._session.get(AuditEventRecord, event_id)
+        return None if record is None else _to_domain(record)
+
     async def list_for_order(self, order_id: UUID) -> list[AuditEvent]:
         rows = await self._session.scalars(
             select(AuditEventRecord)

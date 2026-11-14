@@ -11,6 +11,7 @@ from app.db.repositories.audit import SqlAlchemyAuditLog
 from app.db.repositories.drones import SqlAlchemyDroneStore
 from app.db.repositories.flights import SqlAlchemyFlightStore
 from app.db.repositories.orders import SqlAlchemyOrderStore
+from app.db.repositories.webhooks import SqlAlchemyWebhookStore
 
 
 class SqlAlchemyUnitOfWork:
@@ -18,6 +19,7 @@ class SqlAlchemyUnitOfWork:
     audit: SqlAlchemyAuditLog
     drones: SqlAlchemyDroneStore
     flights: SqlAlchemyFlightStore
+    webhooks: SqlAlchemyWebhookStore
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -27,7 +29,8 @@ class SqlAlchemyUnitOfWork:
         session = self._session_factory()
         self._session = session
         self.audit = SqlAlchemyAuditLog(session)
-        self.orders = SqlAlchemyOrderStore(session, self.audit)
+        self.webhooks = SqlAlchemyWebhookStore(session)
+        self.orders = SqlAlchemyOrderStore(session, self.audit, self.webhooks)
         self.drones = SqlAlchemyDroneStore(session)
         self.flights = SqlAlchemyFlightStore(session, self.audit)
         return self

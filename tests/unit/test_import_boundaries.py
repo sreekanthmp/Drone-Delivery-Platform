@@ -21,6 +21,9 @@ Layers and what each may import (besides the standard library):
 ``app/simulator``     structlog, ``app.domain``, ``app.protocol``, ``app.mqtt``,
                       ``app.config``, ``app.logging``, ``app.simulator``: it plays a drone, so
                       it knows nothing of dispatch or the database
+``app/webhooks``      httpx, pydantic, structlog, ``app.domain``, ``app.adapters``,
+                      ``app.services.ports``, ``app.webhooks``: it reads orders and writes
+                      deliveries, and has no drone link, MQTT, compliance or database layer
 ``app/api``           FastAPI/Starlette/Pydantic/structlog, ``app.domain``,
                       ``app.services``, ``app.adapters``, ``app.api``, from dispatch only
                       ``app.dispatch.service`` and ``app.dispatch.exceptions``, and from the
@@ -110,6 +113,15 @@ RULES: dict[str, LayerRule] = {
             }
         ),
     ),
+    # The webhook sender. It asks the partner's adapter to render each update (Rule 3) and POSTs
+    # it. It reads orders through the store ports and has no way to change one (Rule 4), no
+    # drone link, MQTT client or compliance provider (Rules 1 and 2), and no database layer
+    # (the composition root hands it a unit-of-work factory). ``__main__.py`` is its entry
+    # point and a composition root, so it is not scanned (it is checked to be a thin shim).
+    "app/webhooks": LayerRule(
+        frozenset({"httpx", "pydantic", "structlog"}),
+        frozenset({"app.domain", "app.adapters", "app.services.ports", "app.webhooks"}),
+    ),
     # Handlers may call the dispatch service and render its errors, but never import the
     # drone link: the service is the only thing that may talk to a drone (Rule 1).
     "app/api": LayerRule(
@@ -158,7 +170,11 @@ def find_boundary_violations(source: str, rule: LayerRule) -> list[str]:
 
 
 def _files(layer: str) -> list[Path]:
-    return sorted((ROOT / layer).rglob("*.py"))
+    files = sorted((ROOT / layer).rglob("*.py"))
+    if layer == "app/webhooks":
+        # The entry point is a composition root (like app/main.py): it is a shim, see below.
+        files = [path for path in files if path.name != "__main__.py"]
+    return files
 
 
 def _relative(path: Path) -> str:
@@ -194,8 +210,19 @@ def test_the_adapters_do_mention_their_partners() -> None:
     assert any(pattern.search(p.read_text()) for p in _files("app/adapters"))
 
 
+def test_the_webhook_entry_point_is_only_a_shim() -> None:
+    """``python -m app.webhooks`` is exempt from the layer scan, so it may do nothing but call
+    the composition root (``app.webhook_worker``)."""
+    path = ROOT / "app" / "webhooks" / "__main__.py"
+    if not path.exists():
+        pytest.skip("the entry point is added with the process, in the next step")
+    assert set(_imported_modules(path.read_text())) <= {"app.webhook_worker"}
+    assert len(path.read_text().splitlines()) <= 12
+
+
 class TestTheDetectorItself:
     ADAPTERS = RULES["app/adapters"]
+    WEBHOOKS = RULES["app/webhooks"]
     API = RULES["app/api"]
     SERVICES = RULES["app/services"]
 
@@ -242,6 +269,48 @@ class TestTheDetectorItself:
     def test_flags_the_api_reaching_the_drone_link_or_dispatch_internals(self, source: str) -> None:
         """Rule 1: a route handler must not be able to talk to a drone directly."""
         assert find_boundary_violations(source, self.API) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from app.dispatch.link import DroneLink",  # Rule 1
+            "from app.dispatch.service import DispatchService",
+            "from app.compliance.interface import ComplianceProvider",  # Rule 2
+            "from app.mqtt.client import MqttClient",
+            "from app.protocol import topics",
+            "from app.db.uow import SqlAlchemyUnitOfWork",
+            "from app.services.order_service import OrderService",  # Rule 4: no door to orders
+            "from app.domain.order_state_machine import OrderStateMachine",  # allowed: see below
+            "from app.adapters.swiggy import SwiggyAdapter",  # allowed: see below
+            "from app.realtime.ports import Broadcast",
+            "from app.config import Settings",
+            "import sqlalchemy",
+            "import fastapi",
+            "import redis",
+        ],
+    )
+    def test_the_webhook_sender_reaches_nothing_it_should_not(self, source: str) -> None:
+        allowed = {
+            "from app.domain.order_state_machine import OrderStateMachine",
+            "from app.adapters.swiggy import SwiggyAdapter",
+        }
+        violations = find_boundary_violations(source, self.WEBHOOKS)
+        assert (violations == []) is (source in allowed)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "import httpx",
+            "from app.services.ports import UnitOfWorkFactory",
+            "from app.adapters.registry import AdapterRegistry",
+            "from app.domain.models import WebhookDelivery",
+            "from app.webhooks.retry import RetryPolicy",
+            "import structlog",
+            "from pydantic import BaseModel",
+        ],
+    )
+    def test_allows_the_webhook_sender_what_it_needs(self, source: str) -> None:
+        assert find_boundary_violations(source, self.WEBHOOKS) == []
 
     @pytest.mark.parametrize(
         "source",
