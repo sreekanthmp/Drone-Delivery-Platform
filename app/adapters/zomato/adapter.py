@@ -20,7 +20,15 @@ from typing import Any, Final
 from app.adapters.base import HTTP_STATUS_FOR_ERROR, ClientError, ClientResponse
 from app.adapters.common import iso, order_status_of, truncate_description, validate_payload
 from app.adapters.zomato.schemas import ZomatoOrderPayload
-from app.domain.models import AuditEvent, Location, Order, OrderRequest, OrderStatus, Package
+from app.domain.models import (
+    AuditEvent,
+    Location,
+    Order,
+    OrderRequest,
+    OrderStatus,
+    Package,
+    TrackingPosition,
+)
 
 STATE_NAMES: Final[Mapping[OrderStatus, str]] = {
     OrderStatus.CREATED: "accepted",
@@ -78,6 +86,31 @@ class ZomatoAdapter:
             "state": STATE_NAMES[order_status_of(order, event)],
             "event_ts": iso(event.occurred_at),
             "event_ref": str(event.event_id),
+        }
+
+    def render_tracking_update(
+        self, order: Order, position: TrackingPosition | None
+    ) -> Mapping[str, Any]:
+        return {
+            "success": True,
+            "order": {
+                "id": _public_id(order.external_order_id),
+                "platform_ref": str(order.id),
+                "state": STATE_NAMES[order.status],
+                "updated_at": iso(order.updated_at),
+                # GeoJSON: [longitude, latitude, altitude]
+                "location": None
+                if position is None
+                else {
+                    "type": "Point",
+                    "coordinates": [
+                        position.location.longitude,
+                        position.location.latitude,
+                        position.altitude_m,
+                    ],
+                    "as_of": iso(position.observed_at),
+                },
+            },
         }
 
     def render_error(self, error: ClientError) -> ClientResponse:

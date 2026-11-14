@@ -26,6 +26,7 @@ from app.domain.models.permission import (
     PermissionStatus,
     PermissionValidation,
 )
+from app.domain.models.tracking import TrackingPosition
 
 __all__ = [
     "ACTIVE_STATES",
@@ -53,6 +54,7 @@ __all__ = [
     "PermissionRequest",
     "PermissionStatus",
     "PermissionValidation",
+    "TrackingPosition",
     "Waypoint",
     "WaypointKind",
 ]

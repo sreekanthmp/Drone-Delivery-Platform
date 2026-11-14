@@ -30,6 +30,8 @@ from app.api.internal import drones as internal_drones
 from app.api.internal import flights as internal_flights
 from app.api.internal import orders as internal_orders
 from app.api.partner import router as partner
+from app.api.ws import internal as ws_internal
+from app.api.ws import partner as ws_partner
 from app.compliance.interface import ComplianceProvider
 from app.compliance.mock_digital_sky import MockDigitalSky
 from app.config import Settings, get_settings
@@ -42,6 +44,8 @@ from app.dispatch.service import DispatchService
 from app.logging import configure_logging
 from app.mqtt.client import MqttClient
 from app.realtime.connection import connect
+from app.realtime.hub import Hub
+from app.realtime.memory import InMemoryRealtime
 from app.realtime.notifier import AuditBroadcaster
 from app.realtime.ports import LiveView
 from app.realtime.redis_backend import RedisRealtime
@@ -129,6 +133,9 @@ def create_app(
             redis_client, state_ttl=timedelta(seconds=settings.live_state_ttl_seconds)
         )
     notifier = AuditBroadcaster(realtime) if realtime is not None else None
+    hub = Hub(max_queue=settings.ws_queue_size)
+    if isinstance(realtime, InMemoryRealtime):
+        hub.attach_memory(realtime.listeners)
 
     def wire(app: FastAPI, factory: UnitOfWorkFactory) -> None:
         orders = OrderService(factory, notifier=notifier)
@@ -149,6 +156,9 @@ def create_app(
             session_factory = create_session_factory(engine)
             wire(app, lambda: SqlAlchemyUnitOfWork(session_factory))
             app.state.readiness_check = with_mqtt(readiness_check or _database_check(engine))
+        feed_task: asyncio.Task[None] | None = None
+        if isinstance(realtime, RedisRealtime):
+            feed_task = asyncio.create_task(hub.run_redis(realtime))
         mqtt_task: asyncio.Task[None] | None = None
         if mqtt_link is not None and link_client is not None:
             mqtt_task = asyncio.create_task(
@@ -158,6 +168,10 @@ def create_app(
         try:
             yield
         finally:
+            if feed_task is not None:
+                feed_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await feed_task
             if mqtt_task is not None:
                 mqtt_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -171,6 +185,9 @@ def create_app(
     app = FastAPI(title="Drone Delivery Platform", version="0.1.0", lifespan=lifespan)
     app.state.adapter_registry = registry or default_registry()
     app.state.readiness_check = with_mqtt(readiness_check or _always_ready)
+    app.state.hub = hub
+    app.state.ws_ping_s = settings.ws_ping_seconds
+    app.state.realtime = realtime
     if uow_factory is not None:
         wire(app, uow_factory)
 
@@ -181,4 +198,6 @@ def create_app(
     app.include_router(internal_drones.router)
     app.include_router(internal_flights.router)
     app.include_router(internal_alerts.router)
+    app.include_router(ws_internal.router)
+    app.include_router(ws_partner.router)
     return app

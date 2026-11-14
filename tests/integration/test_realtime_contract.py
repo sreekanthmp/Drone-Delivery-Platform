@@ -70,6 +70,20 @@ class TestAlerts:
 
         assert [a.key for a in await live.active()] == [alert().key]
 
+    async def test_raising_again_keeps_the_original_alert_and_its_time(self, live: Any) -> None:
+        """A standing alert says when the trouble *started*, however often it is re-observed."""
+        first = alert()
+        later = alert().model_copy(
+            update={"message": "still silent", "raised_at": T0 + timedelta(minutes=5)}
+        )
+        await live.raise_alert(first)
+
+        assert await live.raise_alert(later) is False
+
+        (kept,) = await live.active()
+        assert kept.raised_at == T0
+        assert kept.message == first.message
+
     async def test_alerts_are_independent_per_kind_and_per_drone(self, live: Any) -> None:
         assert await live.raise_alert(alert(AlertKind.LINK_LOST, DRONE_ID))
         assert await live.raise_alert(alert(AlertKind.LOW_BATTERY, DRONE_ID))

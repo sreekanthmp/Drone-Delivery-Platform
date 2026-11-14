@@ -418,6 +418,46 @@ and assignment). The cancellation goes through the dispatch service, is audited 
 announced as an alert. It **never** touches a staged flight on an `assigned` order (that is
 deliberate), nor any flight that has started: a silent drone in the air is for a person.
 
+### Live streams (WebSocket)
+
+Three read-only streams, fed by the live view. Each starts with a **snapshot**, then sends what
+changes; a quiet stream sends `{"type": "ping"}` every 15 s so a dead connection is noticed.
+
+| Stream | For | Sends |
+|---|---|---|
+| `/ws/internal/fleet` | operations | a snapshot of every drone (stored status, battery, latest sample) and the standing alerts; then `drone_state`, `audit` (committed changes) and `alert` frames |
+| `/ws/internal/orders/{order_id}` | operations | a snapshot of the order; then `audit` frames for its committed changes and `position` frames from the drone carrying it (with battery and phase) |
+| `/ws/partner/{client_id}/orders/{external_order_id}` | a partner | **only the partner's own format**, rendered by its adapter (Rule 3): the order's status in the partner's vocabulary and, while a drone is carrying the package (picked up, in flight, arriving), where it is. Ends (close `1000`) when the order does |
+
+**What a partner can never see.** The adapter is handed a `TrackingPosition`, a type with room for
+a location, an altitude and a time and nothing else, so a renderer cannot leak the drone, the
+flight or the battery. A position is never shown while the order is only `assigned` or once it is
+finished. Flight-level changes are internal and produce no partner frame.
+
+**Positions are scoped to the order's own flight**, not just its drone: a drone that has moved on
+to another order, or is only flying home, never appears as this order's position. A stream that
+starts following a drone fetches its latest sample at once, rather than waiting for the next one.
+
+**Read-only (Rule 1).** Whatever a client sends is ignored: the only look at the client is "has it
+disconnected". The only service calls a stream makes are reads from an explicit allow-list, and an
+architecture test proves both, so a stream cannot be used to command or change anything.
+
+**Slow watchers** have a bounded queue (`WS_QUEUE_SIZE`, 100). When it fills, a position is dropped
+(oldest first) because the next one supersedes it; a status change or alert is **never** dropped.
+If a watcher is so far behind that only undroppable messages are queued, or the Redis feed itself
+drops, the connection is closed with `1013` ("reconnect") so the client re-syncs from a fresh
+snapshot instead of being left with a silently wrong picture. Each stream subscribes *before* it
+reads its snapshot, so nothing can fall in between.
+
+| Close code | Meaning |
+|---|---|
+| `1000` | the stream finished (the partner's order ended) |
+| `1013` | try again: there is no live view (no Redis, or its feed is down) or the watcher must re-sync |
+| `4404` | the order (or partner) in the URL does not exist; an error frame (in the partner's format for partners) is sent first |
+
+**No authentication** (none has been requested): the streams are identified only by the ids in the
+URL, so anyone who knows an order's id can watch it. Do not expose them publicly.
+
 ### Known limits (MQTT and live tracking)
 
 - **No auth or TLS on the broker or Redis** (none was requested): the dev configs accept anonymous
@@ -430,6 +470,9 @@ deliberate), nor any flight that has started: a silent drone in the air is for a
   is the safety net for a lost `mission_completed`.
 - Redis pub/sub is fire-and-forget: a watcher that misses a message re-syncs from a snapshot.
 - Standing alerts are raised again once after a Redis wipe (they are rebuilt from the next pass).
+- Every API process receives every live message (one pattern subscription, routed in-process), which
+  is fine for a modest fleet; a very large one would shard the channels.
+- A partner position is the drone's last sample (about once a second), not interpolated.
 
 ## Development
 
@@ -497,7 +540,7 @@ database can never look like a green run.
 | 4A | Drones, compliance (mock Digital Sky) and the flight lifecycle: flight state machine with the Rule 2 start gate, drone selection, drone/flight persistence and database guards | **done** |
 | 4B | Dispatch workflow, mission planner, drone link (start/pause/RTH/land), cancellation, internal dispatch API | **done** |
 | 5A | MQTT drone link and wire contract, drone-reported progress events, telemetry worker, drone simulator, Mosquitto in compose | **done** |
-| 5B | Telemetry samples, Redis, heartbeats and alerts, reaper for stale reservations (done); WebSocket tracking streams (next) | **in progress** |
+| 5B | Telemetry samples, Redis, heartbeats and alerts, reaper for stale reservations, WebSocket tracking streams (ops fleet, order, partner) | **done** |
 | 6 | Webhooks: sender, retries, idempotency, failure tracking | planned |
 | 7 | Ops dashboard APIs, hardening, end-to-end tests | planned |
 
@@ -614,3 +657,12 @@ database can never look like a green run.
 - [2026-11-14] The state TTL (60 s) is longer than the link-lost threshold (15 s) by design, and a settings test pins it: otherwise a silent drone would simply vanish from the view instead of raising an alert.
 - [2026-11-14] The Rule 1 "who may publish" scan now looks for MQTT-shaped receivers rather than every `.publish`: Redis broadcasts are views for people, not messages to drones, and the layer rules already confine MQTT clients to the modules allowed to import one.
 - [2026-11-14] Each telemetry module has an explicit allow-list of the dispatch-service methods it may call (the ingest only `record_progress`, the recorder only `drone_exists` and `record_battery`, ...), checked by an architecture test: a private route to the database or a command from the telemetry side is a test failure.
+- [2026-11-14] There are three streams: an ops fleet stream, a platform order stream and a partner order stream rendered through each partner's adapter (user-approved): partner formats must never reach core code (Rule 3), so the partner stream asks the adapter for a new `render_tracking_update` rather than formatting anything itself.
+- [2026-11-14] A partner sees a position only while a drone is carrying the package, and never the drone, flight or battery (user-approved): the adapter receives a `TrackingPosition` that has no room for them, so privacy is a property of the type, not of each renderer's care.
+- [2026-11-14] A slow watcher drops positions (oldest first) but never status changes or alerts, and is closed with `1013` to re-sync when it cannot keep up (user-approved): a position is superseded by the next, a missed status change would be a silent lie.
+- [2026-11-14] Streams are read-only: client messages are never interpreted, only reads are called, and architecture tests enforce both (Rule 1); the exact set of three WebSocket routes is pinned.
+- [2026-11-14] One Redis pattern subscription per process feeds an in-process hub with bounded per-connection queues, instead of a Redis subscription per connection: Redis connections and memory stay bounded however many people watch.
+- [2026-11-14] Each stream subscribes before it reads its snapshot, and a Redis feed interruption closes every watcher with `1013` so it re-syncs: a gap in a live feed must be visible to its consumers, not papered over.
+- [2026-11-14] A position is shown only if the drone's sample is for the order's current flight (not merely the same drone), and a stream that starts following a drone adopts its latest sample at once: found by a test, a sample published just before the stream learnt the drone was lost, and a drone must never show up as another order's position.
+- [2026-11-14] The partner stream sends nothing for a position it is hiding or for flight-level changes: found by a test, a hidden position produced a pointless frame; a partner should hear only about what it may see.
+- [2026-11-14] A stream refuses with `1013` and an error frame when there is no live view, rendered in the partner's own error format for partners, and `4404` for an unknown order or client: clients get a reason they can read, and the live view being optional is visible rather than silent.

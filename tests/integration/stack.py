@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -23,10 +24,23 @@ from app.realtime.ports import LiveView
 from app.services.ports import UnitOfWorkFactory
 from app.simulator.drone import SimulatedDrone
 from app.simulator.runner import SimulatorRunner
+from app.telemetry.watchdog import WatchdogConfig
 from app.worker import Worker, WorkerConfig
 from tests.api.conftest import register_drone
 from tests.conftest import HOME, T0
 from tests.integration.conftest import RunSql
+
+FAST_WORKER = WorkerConfig(
+    battery_step_percent=5.0,
+    watchdog=WatchdogConfig(
+        link_lost_after=timedelta(seconds=1.0),
+        low_battery_percent=20.0,
+        mismatch_grace=timedelta(seconds=1.5),
+    ),
+    watchdog_interval_s=0.2,
+    reaper_interval_s=0.2,
+    stale_after=timedelta(minutes=5),
+)
 
 
 async def eventually(check: Callable[[], Awaitable[bool]], *, timeout: float = 15.0) -> None:

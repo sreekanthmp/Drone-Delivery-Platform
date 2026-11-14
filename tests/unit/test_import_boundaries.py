@@ -22,8 +22,9 @@ Layers and what each may import (besides the standard library):
                       ``app.config``, ``app.logging``, ``app.simulator``: it plays a drone, so
                       it knows nothing of dispatch or the database
 ``app/api``           FastAPI/Starlette/Pydantic/structlog, ``app.domain``,
-                      ``app.services``, ``app.adapters``, ``app.api``, and from dispatch
-                      only ``app.dispatch.service`` and ``app.dispatch.exceptions``
+                      ``app.services``, ``app.adapters``, ``app.api``, from dispatch only
+                      ``app.dispatch.service`` and ``app.dispatch.exceptions``, and from the
+                      live view only its models, ports, channels and hub
 ====================  ==============================================================
 
 So partner formats (adapters) never reach core code; core never imports the HTTP layer or
@@ -121,7 +122,12 @@ RULES: dict[str, LayerRule] = {
                 "app.api",
                 "app.dispatch.service",
                 "app.dispatch.exceptions",
+                # the live streams read the hub and the live view through its ports, never the
+                # Redis backend or the in-memory one (those are wired in the composition root)
                 "app.realtime.models",
+                "app.realtime.ports",
+                "app.realtime.channels",
+                "app.realtime.hub",
             }
         ),
     ),
@@ -430,17 +436,24 @@ class TestTheDetectorItself:
             "import redis.asyncio",  # only the live view talks to Redis
             "from app.realtime.redis_backend import RedisRealtime",
             "from app.realtime.memory import InMemoryRealtime",
-            "from app.realtime.channels import FLEET",
+            "from app.realtime.connection import connect",
+            "from app.realtime.notifier import AuditBroadcaster",
         ],
     )
     def test_flags_the_api_and_telemetry_reaching_into_the_redis_backend(self, source: str) -> None:
         assert find_boundary_violations(source, RULES["app/api"]) != []
 
-    def test_allows_the_api_the_alert_models_only(self) -> None:
-        assert (
-            find_boundary_violations("from app.realtime.models import Alert", RULES["app/api"])
-            == []
-        )
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from app.realtime.models import Alert",
+            "from app.realtime.ports import LiveView",
+            "from app.realtime.channels import FLEET",
+            "from app.realtime.hub import Hub",
+        ],
+    )
+    def test_allows_the_api_the_live_views_models_ports_channels_and_hub(self, source: str) -> None:
+        assert find_boundary_violations(source, RULES["app/api"]) == []
 
     @pytest.mark.parametrize("source", ["import redis", "from redis.asyncio import Redis"])
     def test_flags_redis_anywhere_but_the_live_view(self, source: str) -> None:

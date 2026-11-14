@@ -266,6 +266,24 @@ class TestTheReaper:
         rig.dispatch._flight_or_none = original  # type: ignore[method-assign]
         assert (await rig.dispatch.get_flight(flight_id)).status is S.PERMISSION_GRANTED
 
+    async def test_a_flight_touched_again_while_it_was_being_considered_is_skipped(
+        self, rig: Rig, database: InMemoryDatabase, clock: FakeClock
+    ) -> None:
+        _, flight_id, _ = await plant(rig, database, S.PERMISSION_GRANTED)
+        clock.advance(minutes=6)
+        original = rig.dispatch._flight_or_none
+
+        async def touched(fid: UUID) -> Any:
+            flight = await original(fid)
+            assert flight is not None
+            return replace(flight, updated_at=clock())  # something changed it just now
+
+        rig.dispatch._flight_or_none = touched  # type: ignore[method-assign]
+
+        assert await rig.dispatch.release_stale_reservations(STALE) == []
+        rig.dispatch._flight_or_none = original  # type: ignore[method-assign]
+        assert (await rig.dispatch.get_flight(flight_id)).status is S.PERMISSION_GRANTED
+
     async def test_a_dispatch_that_was_still_running_finds_its_flight_cancelled(
         self, rig: Rig, database: InMemoryDatabase, clock: FakeClock
     ) -> None:

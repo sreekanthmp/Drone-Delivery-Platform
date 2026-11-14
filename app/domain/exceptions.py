@@ -60,6 +60,10 @@ class InconsistentTransitionResultError(DomainError):
     """A transition result pairs an order with an audit event that does not match it."""
 
 
+class TrackingValidationError(DomainError):
+    """A tracking position is malformed."""
+
+
 # --- drones --------------------------------------------------------------------------------
 
 

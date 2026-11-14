@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     stale_reservation_minutes: int = Field(default=5, ge=1)
     """A flight a dispatch left unfinished this long is cancelled and its drone freed."""
 
+    ws_queue_size: int = Field(default=100, ge=1)
+    """Messages a WebSocket watcher may fall behind by before it is told to re-sync."""
+
+    ws_ping_seconds: float = Field(default=15.0, gt=0)
+    """A quiet stream sends a ping this often, so a dead connection is noticed."""
+
     watchdog_interval_seconds: float = Field(default=5.0, gt=0)
     reaper_interval_seconds: float = Field(default=60.0, gt=0)
 

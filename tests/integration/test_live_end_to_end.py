@@ -29,27 +29,13 @@ from app.realtime.models import DroneState, Envelope
 from app.realtime.redis_backend import RedisRealtime
 from app.services.ports import UnitOfWorkFactory
 from app.simulator.drone import Phase
-from app.telemetry.watchdog import WatchdogConfig
-from app.worker import WorkerConfig
 from tests.api.conftest import place_order
 from tests.conftest import T0
 from tests.integration.conftest import RunSql
 from tests.integration.flights import FlightFlow
-from tests.integration.stack import Stack, audit, eventually, is_, order_is
+from tests.integration.stack import FAST_WORKER, Stack, audit, eventually, is_, order_is
 
 pytestmark = pytest.mark.integration
-
-FAST_WORKER = WorkerConfig(
-    battery_step_percent=5.0,
-    watchdog=WatchdogConfig(
-        link_lost_after=timedelta(seconds=1.0),
-        low_battery_percent=20.0,
-        mismatch_grace=timedelta(seconds=1.5),
-    ),
-    watchdog_interval_s=0.2,
-    reaper_interval_s=0.2,
-    stale_after=timedelta(minutes=5),
-)
 
 
 @contextlib.asynccontextmanager

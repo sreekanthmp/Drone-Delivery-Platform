@@ -18,7 +18,15 @@ from typing import Any, Final
 from app.adapters.base import HTTP_STATUS_FOR_ERROR, ClientError, ClientResponse
 from app.adapters.common import iso, order_status_of, validate_payload
 from app.adapters.mock_client.schemas import MockOrderPayload
-from app.domain.models import AuditEvent, Location, Order, OrderRequest, OrderStatus, Package
+from app.domain.models import (
+    AuditEvent,
+    Location,
+    Order,
+    OrderRequest,
+    OrderStatus,
+    Package,
+    TrackingPosition,
+)
 
 STATUS_NAMES: Final[Mapping[OrderStatus, str]] = {status: status.value for status in OrderStatus}
 
@@ -54,6 +62,24 @@ class MockClientAdapter:
             "status": STATUS_NAMES[order_status_of(order, event)],
             "event_id": str(event.event_id),
             "occurred_at": iso(event.occurred_at),
+        }
+
+    def render_tracking_update(
+        self, order: Order, position: TrackingPosition | None
+    ) -> Mapping[str, Any]:
+        return {
+            "order_id": order.external_order_id,
+            "tracking_id": str(order.id),
+            "status": STATUS_NAMES[order.status],
+            "updated_at": iso(order.updated_at),
+            "position": None
+            if position is None
+            else {
+                "lat": position.location.latitude,
+                "lng": position.location.longitude,
+                "alt_m": position.altitude_m,
+                "as_of": iso(position.observed_at),
+            },
         }
 
     def render_error(self, error: ClientError) -> ClientResponse:

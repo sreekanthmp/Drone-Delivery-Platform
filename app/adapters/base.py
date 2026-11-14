@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Final, Protocol
 
-from app.domain.models import AuditEvent, Order, OrderRequest
+from app.domain.models import AuditEvent, Order, OrderRequest, TrackingPosition
 
 
 class ErrorCode(StrEnum):
@@ -93,6 +93,17 @@ class ClientAdapter(Protocol):
 
         Used by the webhook sender (a later phase) and, like every body here, must be
         JSON-serialisable.
+        """
+        ...
+
+    def render_tracking_update(
+        self, order: Order, position: TrackingPosition | None
+    ) -> Mapping[str, Any]:
+        """The partner-format body of a live tracking message: the order's status and, while
+        a drone is carrying it, where it is.
+
+        It carries only what a :class:`TrackingPosition` can: no drone, flight or battery.
+        ``position`` is ``None`` whenever the partner should not (or cannot) see one.
         """
         ...
 

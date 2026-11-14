@@ -42,6 +42,10 @@ class RedisRealtime:
     async def ping(self) -> None:
         await self._redis.ping()
 
+    def pubsub(self) -> Any:
+        """A pub/sub connection (the hub reads the live feed through it)."""
+        return self._redis.pubsub()
+
     # --- StateStore --------------------------------------------------------------------------
 
     async def set_state(self, state: DroneState) -> None:

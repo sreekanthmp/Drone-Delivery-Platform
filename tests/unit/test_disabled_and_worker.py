@@ -15,6 +15,7 @@ from app.dispatch.progress import ProgressEvent
 from app.dispatch.service import DispatchOutcome, DispatchService
 from app.domain.models import EventSource, OrderStatus
 from app.protocol import topics
+from app.realtime.memory import InMemoryRealtime
 from app.services.order_service import OrderService
 from app.telemetry.ingest import IngestOutcome
 from app.worker import Worker
@@ -112,6 +113,54 @@ class TestWorker:
     @pytest.fixture
     def worker(self, rig: Rig) -> Worker:
         return Worker(rig.uow_factory, FakeClient())  # type: ignore[arg-type]
+
+    async def test_with_a_live_view_it_also_records_every_drones_telemetry(self, rig: Rig) -> None:
+        client = FakeClient()
+        worker = Worker(rig.uow_factory, client, live=InMemoryRealtime())  # type: ignore[arg-type]
+        task = asyncio.create_task(worker.run())
+        await asyncio.sleep(0.01)
+
+        assert set(client.subscriptions) == {topics.EVENTS_FILTER, topics.TELEMETRY_FILTER}
+        assert client.subscriptions[topics.TELEMETRY_FILTER] == worker.on_sample
+        assert worker.recorder is not None
+        assert worker.watchdog is not None
+        task.cancel()
+
+    async def test_without_a_live_view_it_has_no_recorder_or_watchdog_but_still_a_reaper(
+        self, rig: Rig, worker: Worker
+    ) -> None:
+        assert worker.recorder is None
+        assert worker.watchdog is None
+        assert worker.reaper is not None
+
+    async def test_a_sample_is_recorded_into_the_live_view(self, rig: Rig) -> None:
+        live = InMemoryRealtime()
+        worker = Worker(rig.uow_factory, FakeClient(), live=live)  # type: ignore[arg-type]
+        drone = await rig.add_drone()
+        sample = (
+            b'{"sent_at": "%s", "latitude": 12.9, "longitude": 77.5, "altitude_m": 10,'
+            b' "battery_percent": 70, "phase": "idle"}'
+        ) % T0.isoformat().encode()
+
+        await worker.on_sample(topics.telemetry_topic(drone.id), sample)
+
+        state = await live.get_state(drone.id)
+        assert state is not None
+        assert state.battery_percent == 70.0
+
+    @pytest.mark.parametrize("topic", ["drones/not-a-uuid/telemetry", "drones/+/telemetry", ""])
+    async def test_a_sample_on_a_malformed_topic_is_dropped(self, rig: Rig, topic: str) -> None:
+        live = InMemoryRealtime()
+        worker = Worker(rig.uow_factory, FakeClient(), live=live)  # type: ignore[arg-type]
+
+        await worker.on_sample(topic, b"{}")
+
+        assert live.published == []
+
+    async def test_a_sample_without_a_live_view_is_ignored(self, rig: Rig, worker: Worker) -> None:
+        drone = await rig.add_drone()
+
+        await worker.on_sample(topics.telemetry_topic(drone.id), b"{}")  # no recorder: no crash
 
     async def test_it_subscribes_to_every_drones_events(self, rig: Rig) -> None:
         client = FakeClient()

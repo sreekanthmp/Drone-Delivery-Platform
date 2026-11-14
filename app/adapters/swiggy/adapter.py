@@ -19,7 +19,15 @@ from typing import Any, Final
 from app.adapters.base import HTTP_STATUS_FOR_ERROR, ClientError, ClientResponse
 from app.adapters.common import iso, order_status_of, truncate_description, validate_payload
 from app.adapters.swiggy.schemas import SwiggyOrderPayload
-from app.domain.models import AuditEvent, Location, Order, OrderRequest, OrderStatus, Package
+from app.domain.models import (
+    AuditEvent,
+    Location,
+    Order,
+    OrderRequest,
+    OrderStatus,
+    Package,
+    TrackingPosition,
+)
 
 STATUS_NAMES: Final[Mapping[OrderStatus, str]] = {
     OrderStatus.CREATED: "PLACED",
@@ -75,6 +83,27 @@ class SwiggyAdapter:
             "event": STATUS_NAMES[order_status_of(order, event)],
             "timestamp": iso(event.occurred_at),
             "reference": str(event.event_id),
+        }
+
+    def render_tracking_update(
+        self, order: Order, position: TrackingPosition | None
+    ) -> Mapping[str, Any]:
+        return {
+            "status": "success",
+            "data": {
+                "swiggy_order_id": order.external_order_id,
+                "drone_order_ref": str(order.id),
+                "order_status": STATUS_NAMES[order.status],
+                "last_updated": iso(order.updated_at),
+                "live_location": None
+                if position is None
+                else {
+                    "latitude": position.location.latitude,
+                    "longitude": position.location.longitude,
+                    "altitude_meters": position.altitude_m,
+                    "as_of": iso(position.observed_at),
+                },
+            },
         }
 
     def render_error(self, error: ClientError) -> ClientResponse:
