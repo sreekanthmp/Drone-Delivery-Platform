@@ -458,7 +458,10 @@ COMMAND_TOPIC_HOMES = {
     "app/protocol/topics.py",  # defines them
     "app/dispatch/mqtt_link.py",  # the one publisher of commands
 }
-COMMAND_TOPIC_PREFIXES = ("app/simulator/",)  # the drone side subscribes to them
+COMMAND_TOPIC_PREFIXES = (
+    "app/simulator/",  # the drone side subscribes to them
+    "app/demo/",  # the demo's loopback plays the drone side (it receives, never sends, commands)
+)
 PUBLISHERS = {
     "app/dispatch/mqtt_link.py",  # commands
     "app/mqtt/client.py",  # the client's own publish

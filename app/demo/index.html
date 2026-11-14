@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drone delivery demo</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #667085; --line: #dfe3ea;
+    --accent: #2563eb; --ok: #16a34a; --bad: #dc2626; --warn: #d97706; --map: #eef2f7;
+    --dock: #475467; --restaurant: #ea580c; --customer: #16a34a; --drone: #2563eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #11151c; --panel: #1a202b; --ink: #e8ecf3; --muted: #98a2b3; --line: #2b3342;
+      --accent: #60a5fa; --ok: #4ade80; --bad: #f87171; --warn: #fbbf24; --map: #151b25;
+      --dock: #98a2b3; --restaurant: #fb923c; --customer: #4ade80; --drone: #60a5fa;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 18px 20px 6px; max-width: 1180px; margin: 0 auto; }
+  h1 { margin: 0 0 4px; font-size: 20px; }
+  header p { margin: 0; color: var(--muted); max-width: 70ch; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px;
+         padding: 12px 20px 28px; max-width: 1180px; margin: 0 auto; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  canvas { display: block; width: 100%; height: auto; border-radius: 12px; background: var(--map); }
+  .side { display: flex; flex-direction: column; gap: 12px; }
+  .pad { padding: 14px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+           padding: 8px 14px; border-radius: 8px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  label { color: var(--muted); font-size: 14px; display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+  #banner { margin-top: 12px; padding: 10px 12px; border-radius: 8px; background: var(--bg);
+            border: 1px solid var(--line); color: var(--muted); min-height: 42px; }
+  #banner.ok { border-color: var(--ok); color: var(--ink); }
+  #banner.bad { border-color: var(--bad); color: var(--ink); }
+  h2 { margin: 0 0 8px; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+  ol { list-style: none; margin: 0; padding: 0; }
+  #steps li { display: flex; gap: 10px; align-items: center; padding: 4px 0; color: var(--muted); }
+  #steps li::before { content: ""; width: 12px; height: 12px; border-radius: 50%; flex: none;
+                      border: 2px solid var(--line); }
+  #steps li.done { color: var(--ink); }
+  #steps li.done::before { background: var(--ok); border-color: var(--ok); }
+  #steps li.bad { color: var(--ink); }
+  #steps li.bad::before { background: var(--bad); border-color: var(--bad); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td, th { text-align: left; padding: 3px 0; }
+  th { color: var(--muted); font-weight: 500; }
+  #log { max-height: 150px; overflow: auto; font: 12.5px/1.5 ui-monospace, Menlo, Consolas, monospace;
+         color: var(--muted); }
+  #log div b { color: var(--ink); font-weight: 600; }
+  .legend { display: flex; gap: 14px; padding: 8px 14px 12px; color: var(--muted); font-size: 13px; flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Drone delivery platform: live demo</h1>
+  <p>This is the real platform running in one process with simulated drones. No flight starts until
+     permission is confirmed, and the cloud only ever uploads a mission and sends start, pause,
+     return-to-home or land. Place an order and watch it happen.</p>
+</header>
+<main>
+  <section class="card">
+    <canvas id="map" width="860" height="560"></canvas>
+    <div class="legend">
+      <span><i style="background:var(--restaurant)"></i>Restaurant (pickup)</span>
+      <span><i style="background:var(--customer)"></i>Customer (dropoff)</span>
+      <span><i style="background:var(--dock);border-radius:2px"></i>Drone dock</span>
+      <span><i style="background:var(--drone)"></i>Drone</span>
+    </div>
+  </section>
+  <aside class="side">
+    <div class="card pad">
+      <div class="row">
+        <button id="order" class="primary">Place order</button>
+        <button id="cancel" disabled>Cancel order</button>
+      </div>
+      <label><input type="checkbox" id="closed"> Close the airspace (permission will be refused)</label>
+      <div id="banner">Press <b>Place order</b> to send a delivery request.</div>
+    </div>
+    <div class="card pad">
+      <h2>Order progress</h2>
+      <ol id="steps"></ol>
+    </div>
+    <div class="card pad">
+      <h2>Drones</h2>
+      <table><thead><tr><th>Drone</th><th>Doing</th><th>Battery</th></tr></thead><tbody id="fleet"></tbody></table>
+    </div>
+    <div class="card pad">
+      <h2>What the platform recorded</h2>
+      <div id="log"></div>
+    </div>
+  </aside>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const canvas = $("map"), ctx = canvas.getContext("2d");
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+const STEPS = [
+  ["created", "Order received"], ["planned", "Drone chosen"], ["permission_granted", "Permission granted"],
+  ["mission_uploaded", "Mission uploaded to the drone"], ["started", "Flight started"],
+  ["picked_up", "Package picked up"], ["in_flight", "On its way"], ["arriving", "Arriving"],
+  ["delivered", "Delivered"], ["completed", "Drone back at its dock"],
+];
+const PHASE_TEXT = { idle: "at its dock", ready: "loaded", flying: "flying", paused: "paused",
+                     returning: "returning", landed: "landed" };
+
+let config = null, ws = null, current = null, counter = 0;
+const drones = new Map();       // id -> {name, home, lat, lng, targetLat, targetLng, phase, battery}
+let trail = [];
+
+// ---- map -----------------------------------------------------------------------------------
+function bounds() {
+  const pts = [config.pickup, config.dropoff, ...config.docks];
+  const lats = pts.map(p => p.lat), lngs = pts.map(p => p.lng);
+  return { minLat: Math.min(...lats), maxLat: Math.max(...lats), minLng: Math.min(...lngs), maxLng: Math.max(...lngs) };
+}
+function projector() {
+  const b = bounds(), W = canvas.width, H = canvas.height, pad = 70;
+  const k = Math.cos(((b.minLat + b.maxLat) / 2) * Math.PI / 180);
+  const dx = (b.maxLng - b.minLng) * k, dy = b.maxLat - b.minLat;
+  const s = Math.min((W - 2 * pad) / dx, (H - 2 * pad) / dy);
+  const ox = (W - dx * s) / 2, oy = (H - dy * s) / 2;
+  return (lat, lng) => [ox + (lng - b.minLng) * k * s, H - (oy + (lat - b.minLat) * s)];
+}
+function label(text, x, y, color) {
+  ctx.fillStyle = color; ctx.font = "600 13px system-ui, sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(text, x, y);
+}
+function draw() {
+  requestAnimationFrame(draw);
+  if (!config) return;
+  const P = projector();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = css("--map"); ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const [px, py] = P(config.pickup.lat, config.pickup.lng), [dx, dy] = P(config.dropoff.lat, config.dropoff.lng);
+  ctx.setLineDash([8, 8]); ctx.strokeStyle = css("--line"); ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(dx, dy); ctx.stroke(); ctx.setLineDash([]);
+
+  if (trail.length > 1) {
+    ctx.strokeStyle = css("--drone"); ctx.globalAlpha = .45; ctx.lineWidth = 3; ctx.beginPath();
+    trail.forEach(([lat, lng], i) => { const [x, y] = P(lat, lng); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  for (const d of config.docks) {
+    const [x, y] = P(d.lat, d.lng);
+    ctx.fillStyle = css("--dock"); ctx.fillRect(x - 8, y - 8, 16, 16);
+    label(d.name, x, y + 26, css("--muted"));
+  }
+  ctx.fillStyle = css("--restaurant"); ctx.beginPath(); ctx.arc(px, py, 11, 0, 7); ctx.fill();
+  label("Restaurant", px, py - 18, css("--ink"));
+  ctx.fillStyle = css("--customer"); ctx.beginPath(); ctx.arc(dx, dy, 11, 0, 7); ctx.fill();
+  label("Customer", dx, dy - 18, css("--ink"));
+
+  for (const d of drones.values()) {
+    d.lat += (d.targetLat - d.lat) * 0.25; d.lng += (d.targetLng - d.lng) * 0.25;   // smooth the 4 Hz samples
+    const [x, y] = P(d.lat, d.lng), up = d.phase === "flying" || d.phase === "returning" || d.phase === "paused";
+    ctx.fillStyle = up ? css("--drone") : css("--muted");
+    ctx.beginPath(); ctx.arc(x, y, up ? 9 : 6, 0, 7); ctx.fill();
+    if (up) { ctx.strokeStyle = css("--drone"); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y, 15, 0, 7); ctx.stroke(); }
+  }
+}
+
+// ---- progress ------------------------------------------------------------------------------
+function renderSteps() {
+  $("steps").innerHTML = STEPS.map(([key, text]) => `<li id="step-${key}">${text}</li>`).join("");
+}
+function mark(key, cls = "done") { const el = $("step-" + key); if (el) el.className = cls; }
+function logLine(html) {
+  const row = document.createElement("div"); row.innerHTML = html;
+  $("log").prepend(row);
+}
+function banner(text, kind = "") { const b = $("banner"); b.textContent = text; b.className = kind; }
+
+function renderFleet() {
+  $("fleet").innerHTML = [...drones.values()].map(d =>
+    `<tr><td>${d.name}</td><td>${PHASE_TEXT[d.phase] || d.phase}</td><td>${Math.round(d.battery)}%</td></tr>`).join("");
+}
+function setDrone(id, s) {
+  const d = drones.get(id); if (!d) return;
+  d.targetLat = s.latitude; d.targetLng = s.longitude; d.phase = s.phase; d.battery = s.battery_percent;
+  if (s.flight_id && current && ["flying", "returning", "paused"].includes(s.phase)) {
+    trail.push([s.latitude, s.longitude]);
+  }
+  renderFleet();
+}
+
+// ---- live feed -----------------------------------------------------------------------------
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/internal/fleet");
+  ws.onmessage = (event) => {
+    const m = JSON.parse(event.data);
+    if (m.type === "snapshot") {
+      drones.clear();
+      for (const d of m.drones) {
+        const s = d.state, lat = s ? s.latitude : d.home.latitude, lng = s ? s.longitude : d.home.longitude;
+        drones.set(d.id, { name: d.name, lat, lng, targetLat: lat, targetLng: lng,
+                           phase: s ? s.phase : "idle", battery: s ? s.battery_percent : d.battery_percent });
+      }
+      renderFleet();
+    } else if (m.type === "drone_state") {
+      setDrone(m.drone_id, m);
+    } else if (m.type === "audit" && current && m.order_id === current.id) {
+      onAudit(m);
+    }
+  };
+  ws.onclose = () => setTimeout(connect, 1000);   // the server closes with 1013 to ask us to re-sync
+}
+function onAudit(m) {
+  const bad = ["permission_denied", "upload_failed", "cancelled", "aborted", "failed"].includes(m.new_state);
+  if (bad) logLine(`<b>${m.new_state.replace(/_/g, " ")}</b>`);
+  else logLine(`<b>${m.new_state.replace(/_/g, " ")}</b> (${m.event_type.startsWith("flight") ? "flight" : "order"})`);
+  mark(m.new_state);
+  if (m.new_state === "delivered") banner("Delivered! The drone is heading home.", "ok");
+  if (m.new_state === "completed") { banner("Delivered, and the drone is back at its dock.", "ok"); finish(); }
+  if (m.new_state === "cancelled") { banner("Order cancelled; the flying drone was recalled first.", "bad"); finish(); }
+}
+function finish() { $("cancel").disabled = true; $("order").disabled = false; }
+
+// ---- actions -------------------------------------------------------------------------------
+async function placeOrder() {
+  renderSteps(); $("log").innerHTML = ""; trail = [];
+  $("order").disabled = true;
+  const ext = `DEMO-${++counter}-${Math.random().toString(36).slice(2, 6)}`;
+  const created = await (await fetch("/partner/mock/orders", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ order_id: ext, pickup: config.pickup, dropoff: config.dropoff,
+                           package: { weight_kg: 1.2, description: "2 meals" } }),
+  })).json();
+  current = { id: created.tracking_id, ext };
+  mark("created"); logLine("<b>order received</b> (from a partner, through its adapter)");
+  banner("Order received. Finding a drone and asking for permission to fly...");
+  const result = await (await fetch(`/internal/orders/${current.id}/dispatch`, { method: "POST" })).json();
+  if (result.outcome === "started") {
+    const drone = result.drone ? result.drone.name : "a drone";
+    banner(`Permission granted. Drone "${drone}" has taken off.`, "ok"); $("cancel").disabled = false;
+  } else {
+    const reasons = { permission_denied: "Permission to fly was refused", no_drone_available: "No drone is available",
+                      upload_failed: "The mission could not be loaded onto the drone" };
+    banner(`${reasons[result.outcome] || result.outcome}${result.detail ? ": " + result.detail : ""}. ` +
+           "No drone took off.", "bad");
+    mark(result.outcome === "permission_denied" ? "permission_granted" : "planned", "bad");
+    finish();
+  }
+}
+async function cancelOrder() {
+  $("cancel").disabled = true;
+  await fetch(`/partner/mock/orders/${current.ext}/cancel`, { method: "POST" });
+}
+async function setAirspace(closed) { await fetch(`/demo/airspace?closed=${closed}`, { method: "POST" }); }
+
+$("order").onclick = placeOrder;
+$("cancel").onclick = cancelOrder;
+$("closed").onchange = (e) => setAirspace(e.target.checked);
+
+(async () => {
+  config = await (await fetch("/demo/config")).json();
+  renderSteps(); connect(); draw();
+})();
+</script>
+</body>
+</html>

@@ -9,6 +9,30 @@ reports status back to partners, and keeps an append-only audit trail.
 **Stack:** Python 3.12, FastAPI, Pydantic v2, PostgreSQL + PostGIS, SQLAlchemy 2.0 (async),
 Alembic, Redis, MQTT (Mosquitto), WebSockets, pytest / pytest-asyncio, Docker Compose.
 
+## Quick demo (one command, nothing to install but Python)
+
+```bash
+uv sync
+uv run python -m app.demo          # then open http://127.0.0.1:8000
+```
+
+This runs the **real platform** (the same FastAPI app, partner adapter, order and flight state
+machines, dispatch workflow, mock compliance module, MQTT drone link and live WebSocket stream)
+in one process, with two simulated drones. No Docker, PostgreSQL, Redis or Mosquitto is needed:
+the database, the broker and the live view are in memory.
+
+Press **Place order** and watch the order go through its ten steps on a map: a drone is chosen,
+permission is granted, the mission is uploaded, the drone takes off, picks up, delivers and flies
+home. **Cancel order** recalls the drone. Tick **Close the airspace** first and the platform
+refuses permission, so no drone takes off (Rule 2). Order several at once to use both drones; a
+third gets `no_drone_available`.
+
+Options: `--port 8000`, `--host 127.0.0.1`, `--speed 60` (how much faster than real time the
+simulated drones run; at the default an order is delivered about ten seconds after you place it,
+and the drone is home a few seconds later). It is a prototype: everything is lost on exit, the
+drones are simulated and there is no authentication. The page and `app/demo/` are a view of the real
+system, not a second implementation, and the demo adds no code path around Rules 1 to 5.
+
 ## Architecture rules (non-negotiable)
 
 1. **The cloud never steers a drone.** It only uploads predefined missions and sends
@@ -666,3 +690,7 @@ database can never look like a green run.
 - [2026-11-14] A position is shown only if the drone's sample is for the order's current flight (not merely the same drone), and a stream that starts following a drone adopts its latest sample at once: found by a test, a sample published just before the stream learnt the drone was lost, and a drone must never show up as another order's position.
 - [2026-11-14] The partner stream sends nothing for a position it is hiding or for flight-level changes: found by a test, a hidden position produced a pointless frame; a partner should hear only about what it may see.
 - [2026-11-14] A stream refuses with `1013` and an error frame when there is no live view, rendered in the partner's own error format for partners, and `4404` for an unknown order or client: clients get a reason they can read, and the live view being optional is visible rather than silent.
+- [2026-11-14] A one-command demo (`python -m app.demo`) runs the real app, adapters, state machines, dispatch, mock compliance, MQTT drone link and live WebSocket stream in one process over an in-memory database, with simulated drones (user-approved prototype scope): it proves the flow end to end without Docker, PostgreSQL, Redis or Mosquitto, and it reuses the platform instead of re-implementing it.
+- [2026-11-14] The demo's MQTT is an in-process loopback (`LoopbackMqtt`) that hands each command to a `SimulatedDrone` and returns its ack, so the real `MqttDroneLink` and the wire contract are exercised without a broker; drone events go straight into the real `TelemetryIngest` and samples into the real `TelemetryRecorder`.
+- [2026-11-14] The in-memory unit of work moved from `tests/fakes.py` to `app/services/memory.py` because the demo needs it in application code; `tests/fakes.py` re-exports it so no test changed. It is not selectable by any production setting.
+- [2026-11-14] The demo page is a view only: it places an order and asks for dispatch through the public partner and internal endpoints, and watches `/ws/internal/fleet`. The "Close the airspace" switch changes only what the mock compliance module answers, so a refusal is the platform's own Rule 2 behaviour, not a demo shortcut. The demo adds no authentication (none is requested).
