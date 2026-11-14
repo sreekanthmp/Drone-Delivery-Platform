@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+import structlog
 
 from app.domain.flight_state_machine import FlightStateMachine
 from app.domain.models import (
@@ -76,6 +77,24 @@ class SequentialIds:
     def __call__(self) -> UUID:
         self.issued += 1
         return UUID(int=self.issued)
+
+
+@pytest.fixture(autouse=True)
+def _loggers_stay_capturable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``structlog.testing.capture_logs()`` working in any test order.
+
+    The app's lifespan calls ``configure_logging``, which asks structlog to cache each logger's
+    processors on first use. A logger that has done so can no longer be captured, so a test
+    that asserts on log output would pass alone and fail after any test that ran the lifespan.
+    Production keeps the caching; tests never see it.
+    """
+    configure = structlog.configure
+
+    def without_caching(**settings: Any) -> None:
+        settings["cache_logger_on_first_use"] = False
+        configure(**settings)
+
+    monkeypatch.setattr(structlog, "configure", without_caching)
 
 
 @pytest.fixture

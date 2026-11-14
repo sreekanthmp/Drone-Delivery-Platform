@@ -1,5 +1,11 @@
-# Local infrastructure and the API.
-# Redis and Mosquitto are added in the telemetry phase.
+# Local infrastructure, the API, and the telemetry worker.
+#
+#   docker compose up --build                       API + worker + Postgres + Mosquitto
+#   docker compose --profile simulator up --build   ...plus 3 simulated drones flying missions
+#
+# The API sends drone commands over MQTT (DRONE_LINK=mqtt), so a dispatch only succeeds
+# while something plays the drones: start the simulator profile, or real drones.
+# Redis arrives with live tracking (Phase 5B).
 services:
   postgres:
     image: postgis/postgis:16-3.4
@@ -17,14 +23,31 @@ services:
       timeout: 3s
       retries: 10
 
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./docker/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquittodata:/mosquitto/data
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -t '$$SYS/broker/uptime' -C 1 -W 3 >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   api:
     build: .
     depends_on:
       postgres:
         condition: service_healthy
+      mosquitto:
+        condition: service_healthy
     environment:
-      # Inside the compose network the database host is the service name, not localhost.
+      # Inside the compose network the hosts are the service names, not localhost.
       DATABASE_URL: postgresql+asyncpg://drone:drone@postgres:5432/drone
+      DRONE_LINK: mqtt
+      MQTT_URL: mqtt://mosquitto:1883
     ports:
       - "8000:8000"
     # Apply migrations, then serve. In production run migrations as a separate release step.
@@ -43,5 +66,41 @@ services:
       retries: 5
       start_period: 10s
 
+  # Records what drones report (order progress, flight completion, docking). Run exactly one.
+  worker:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://drone:drone@postgres:5432/drone
+      MQTT_URL: mqtt://mosquitto:1883
+    command: ["python", "-m", "app.worker"]
+
+  # Plays the drones: registers sim-1..sim-3 with the API and flies the missions it is sent.
+  simulator:
+    build: .
+    profiles: ["simulator"]
+    depends_on:
+      api:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://mosquitto:1883
+    command:
+      - python
+      - -m
+      - app.simulator
+      - --api-url
+      - http://api:8000
+      - --fleet
+      - "3"
+      - --speed-factor
+      - "30"
+
 volumes:
   pgdata:
+  mosquittodata:

@@ -52,8 +52,16 @@ from app.dispatch.exceptions import (
 )
 from app.dispatch.link import CommandRejectedError, DroneLink, DroneLinkError
 from app.dispatch.mission import MissionPlanParams, plan_mission
+from app.dispatch.progress import (
+    ORDER_STEP,
+    ProgressEvent,
+    ProgressOutcome,
+    ProgressResult,
+    at_or_beyond,
+)
 from app.domain.exceptions import (
     FlightPermissionError,
+    InvalidDroneTransitionError,
     InvalidFlightTransitionError,
     InvalidTransitionError,
     PermissionCheckStaleError,
@@ -773,6 +781,174 @@ class DispatchService:
             drone_to=D.AVAILABLE,
             drone_from=_ASSIGNED,
         )
+
+    # ==========================================================================================
+    # Progress reported by the drone (telemetry)
+    # ==========================================================================================
+
+    async def record_progress(
+        self,
+        drone_id: UUID,
+        flight_id: UUID,
+        event: ProgressEvent,
+        *,
+        occurred_at: datetime | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> ProgressResult:
+        """Apply something the drone reports. The only way a telemetry event changes anything.
+
+        Idempotent and strict: a repeat is ``ALREADY_APPLIED``; an event that does not fit
+        the current state (wrong order status, a flight that is not flying, another drone's
+        flight) is ``REJECTED`` with a reason and changes nothing. It never invents the
+        steps a lost event would have recorded, and it never sends a command.
+        """
+        if event is ProgressEvent.FAULT:
+            logger.error(
+                "drone_fault",
+                drone_id=str(drone_id),
+                flight_id=str(flight_id),
+                detail=dict(detail or {}),
+            )
+            return ProgressResult(ProgressOutcome.NOTED, "fault logged")
+
+        flight = await self._flight_or_none(flight_id)
+        if flight is None:
+            return self._rejected(event, drone_id, flight_id, "unknown flight")
+        if flight.drone_id != drone_id:
+            return self._rejected(event, drone_id, flight_id, "the flight belongs to another drone")
+
+        if event in ORDER_STEP:
+            result = await self._progress_order(flight, event, occurred_at)
+        elif event is ProgressEvent.MISSION_COMPLETED:
+            result = await self._progress_completion(flight, occurred_at)
+        else:
+            result = await self._progress_docking(flight)
+
+        if result.outcome is ProgressOutcome.REJECTED:
+            return self._rejected(event, drone_id, flight_id, result.reason or "")
+        logger.info(
+            "progress_recorded",
+            progress=event.value,
+            outcome=result.outcome.value,
+            drone_id=str(drone_id),
+            flight_id=str(flight_id),
+        )
+        return result
+
+    @staticmethod
+    def _rejected(
+        event: ProgressEvent, drone_id: UUID, flight_id: UUID, reason: str
+    ) -> ProgressResult:
+        logger.warning(
+            "progress_rejected",
+            progress=event.value,
+            drone_id=str(drone_id),
+            flight_id=str(flight_id),
+            reason=reason,
+        )
+        return ProgressResult(ProgressOutcome.REJECTED, reason)
+
+    @staticmethod
+    def _progress_metadata(
+        flight: Flight, event: ProgressEvent, occurred_at: datetime | None
+    ) -> dict[str, Any]:
+        """What the audit trail keeps of an event: never the drone's free-form text."""
+        metadata: dict[str, Any] = {"flight_id": str(flight.id), "event": event.value}
+        if occurred_at is not None:
+            metadata["occurred_at"] = occurred_at.isoformat()
+        return metadata
+
+    async def _progress_order(
+        self, flight: Flight, event: ProgressEvent, occurred_at: datetime | None
+    ) -> ProgressResult:
+        """Move the flight's order one step along its journey, through the order service."""
+        source_status, target = ORDER_STEP[event]
+        order = await self._orders.get_order(flight.order_id)
+        if at_or_beyond(order.status, target):
+            return ProgressResult(ProgressOutcome.ALREADY_APPLIED)
+        if flight.status not in {S.STARTED, S.PAUSED}:
+            return ProgressResult(
+                ProgressOutcome.REJECTED, f"the flight is {flight.status.value}, not flying"
+            )
+        if order.status is not source_status:
+            return ProgressResult(
+                ProgressOutcome.REJECTED,
+                f"expected the order to be {source_status.value}, but it is {order.status.value}",
+            )
+        try:
+            await self._orders.transition(
+                order.id,
+                target,
+                source=EventSource.TELEMETRY,
+                metadata=self._progress_metadata(flight, event, occurred_at),
+            )
+        except (InvalidTransitionError, ConcurrentUpdateError):
+            # Someone moved the order meanwhile (a duplicate of this event, a cancellation).
+            current = await self._orders.get_order(order.id)
+            if at_or_beyond(current.status, target):
+                return ProgressResult(ProgressOutcome.ALREADY_APPLIED)
+            return ProgressResult(ProgressOutcome.REJECTED, f"the order is {current.status.value}")
+        return ProgressResult(ProgressOutcome.APPLIED)
+
+    async def _progress_completion(
+        self, flight: Flight, occurred_at: datetime | None
+    ) -> ProgressResult:
+        """The drone landed at its dock having finished the mission: end the flight, free it."""
+        if flight.status is S.COMPLETED:
+            return ProgressResult(ProgressOutcome.ALREADY_APPLIED)
+        if flight.status is not S.STARTED:
+            return ProgressResult(
+                ProgressOutcome.REJECTED, f"the flight is {flight.status.value}, not flying"
+            )
+        try:
+            await self._end_flight(
+                flight.id,
+                S.COMPLETED,
+                source=EventSource.TELEMETRY,
+                drone_to=D.AVAILABLE,
+                drone_from=_ON_MISSION,
+                metadata=self._progress_metadata(
+                    flight, ProgressEvent.MISSION_COMPLETED, occurred_at
+                ),
+            )
+        except (InvalidFlightTransitionError, ConcurrentUpdateError):
+            current = await self._flight_or_none(flight.id)
+            if current is not None and current.status is S.COMPLETED:
+                return ProgressResult(ProgressOutcome.ALREADY_APPLIED)
+            return ProgressResult(
+                ProgressOutcome.REJECTED,
+                f"the flight is {current.status.value if current else 'gone'}",
+            )
+        order = await self._orders.get_order(flight.order_id)
+        if order.status is not OrderStatus.DELIVERED:
+            # The drone says it finished but the delivery was never reported. Do not guess.
+            logger.warning(
+                "mission_completed_without_delivery",
+                order_id=str(order.id),
+                order_status=order.status.value,
+                flight_id=str(flight.id),
+            )
+        return ProgressResult(ProgressOutcome.APPLIED)
+
+    async def _progress_docking(self, flight: Flight) -> ProgressResult:
+        """A recalled or grounded drone reports it is back at its dock: it may fly again."""
+        if flight.status.is_live:
+            return ProgressResult(
+                ProgressOutcome.REJECTED,
+                f"the drone reports docked but its flight is {flight.status.value}",
+            )
+        drone = await self.get_drone(flight.drone_id)
+        if drone.status is D.AVAILABLE:
+            return ProgressResult(ProgressOutcome.ALREADY_APPLIED)
+        if drone.status not in {D.RETURNING, D.OFFLINE}:
+            return ProgressResult(
+                ProgressOutcome.REJECTED, f"the drone is {drone.status.value}, not returning"
+            )
+        try:
+            await self.confirm_docked(drone.id)
+        except (DroneBusyError, InvalidDroneTransitionError, ConcurrentUpdateError) as error:
+            return ProgressResult(ProgressOutcome.REJECTED, str(error))
+        return ProgressResult(ProgressOutcome.APPLIED)
 
     # ==========================================================================================
     # Internals

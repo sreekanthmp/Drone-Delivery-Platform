@@ -10,9 +10,12 @@ services, routers), so it is the only module allowed to import across all of the
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from uuid import uuid4
 
 import structlog
 from fastapi import FastAPI
@@ -33,8 +36,10 @@ from app.db.session import create_engine_from_settings, create_session_factory
 from app.db.uow import SqlAlchemyUnitOfWork
 from app.dispatch.in_memory_link import InMemoryDroneLink
 from app.dispatch.link import DroneLink
+from app.dispatch.mqtt_link import MqttDroneLink
 from app.dispatch.service import DispatchService
 from app.logging import configure_logging
+from app.mqtt.client import MqttClient
 from app.services.order_service import OrderService
 from app.services.ports import UnitOfWorkFactory
 
@@ -63,6 +68,7 @@ def create_app(
     readiness_check: ReadinessCheck | None = None,
     compliance: ComplianceProvider | None = None,
     drone_link: DroneLink | None = None,
+    mqtt_client: MqttClient | None = None,
 ) -> FastAPI:
     """Build the application.
 
@@ -70,14 +76,41 @@ def create_app(
     up (lifespan). Passing a ``uow_factory`` (for example the in-memory one) skips the
     database entirely, which is how the API tests run.
 
-    ``compliance`` and ``drone_link`` default to the mock Digital Sky and the in-memory drone
-    link, the only implementations that exist yet; tests pass their own to script failures.
+    ``compliance`` defaults to the mock Digital Sky (the only provider that exists). The drone
+    link follows ``settings.drone_link``: the in-memory stand-in, or MQTT, in which case the
+    app runs an MQTT client for the acknowledgements and reports not-ready while it is not
+    connected. Tests pass their own ``compliance``, ``drone_link`` or ``mqtt_client``.
     """
     settings = settings or get_settings()
     compliance = compliance or MockDigitalSky(
         validity=timedelta(minutes=settings.permission_validity_minutes)
     )
-    drone_link = drone_link or InMemoryDroneLink()
+    mqtt_link: MqttDroneLink | None = None
+    if drone_link is None:
+        if settings.drone_link == "mqtt":
+            instance_id = f"api-{uuid4().hex[:12]}"
+            mqtt_client = mqtt_client or MqttClient(settings.mqtt_url, client_id=instance_id)
+            mqtt_link = MqttDroneLink(
+                mqtt_client,
+                instance_id=instance_id,
+                ack_timeout_s=settings.mqtt_ack_timeout_seconds,
+            )
+            drone_link = mqtt_link
+        else:
+            drone_link = InMemoryDroneLink()
+    link_client = mqtt_client if mqtt_link is not None else None
+
+    def with_mqtt(check: ReadinessCheck) -> ReadinessCheck:
+        """Not ready while the MQTT link has no connection: commands could not be sent."""
+        if link_client is None:
+            return check
+
+        async def combined() -> None:
+            await check()
+            if not link_client.connected:
+                raise RuntimeError("not connected to the MQTT broker")
+
+        return combined
 
     def wire(app: FastAPI, factory: UnitOfWorkFactory) -> None:
         orders = OrderService(factory)
@@ -96,18 +129,27 @@ def create_app(
             engine = create_engine_from_settings(settings)
             session_factory = create_session_factory(engine)
             wire(app, lambda: SqlAlchemyUnitOfWork(session_factory))
-            app.state.readiness_check = readiness_check or _database_check(engine)
+            app.state.readiness_check = with_mqtt(readiness_check or _database_check(engine))
+        mqtt_task: asyncio.Task[None] | None = None
+        if mqtt_link is not None and link_client is not None:
+            mqtt_task = asyncio.create_task(
+                link_client.run({mqtt_link.reply_topic: mqtt_link.handle_ack})
+            )
         logger.info("app_started", clients=app.state.adapter_registry.client_ids())
         try:
             yield
         finally:
+            if mqtt_task is not None:
+                mqtt_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await mqtt_task
             if engine is not None:
                 await engine.dispose()
             logger.info("app_stopped")
 
     app = FastAPI(title="Drone Delivery Platform", version="0.1.0", lifespan=lifespan)
     app.state.adapter_registry = registry or default_registry()
-    app.state.readiness_check = readiness_check or _always_ready
+    app.state.readiness_check = with_mqtt(readiness_check or _always_ready)
     if uow_factory is not None:
         wire(app, uow_factory)
 

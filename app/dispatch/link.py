@@ -66,3 +66,26 @@ class DroneLink(Protocol):
     async def land(self, drone_id: UUID) -> None:
         """Land immediately where the drone is."""
         ...
+
+
+class DisabledDroneLink:
+    """A link that refuses every command: for processes that must never talk to a drone.
+
+    The telemetry worker only records what drones report. Handing it this link means that
+    even a bug in it could not send a command (Rule 1).
+    """
+
+    async def upload_mission(self, drone_id: UUID, mission: Mission) -> MissionAck:
+        raise CommandRejectedError("this process cannot send commands to drones")
+
+    async def start_mission(self, drone_id: UUID, authorization: StartAuthorization) -> None:
+        raise CommandRejectedError("this process cannot send commands to drones")
+
+    async def pause_mission(self, drone_id: UUID) -> None:
+        raise CommandRejectedError("this process cannot send commands to drones")
+
+    async def return_to_home(self, drone_id: UUID) -> None:
+        raise CommandRejectedError("this process cannot send commands to drones")
+
+    async def land(self, drone_id: UUID) -> None:
+        raise CommandRejectedError("this process cannot send commands to drones")

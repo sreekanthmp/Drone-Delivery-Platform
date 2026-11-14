@@ -8,6 +8,8 @@ from typing import Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.mqtt.url import parse_mqtt_url
+
 _ASYNC_PG_PREFIX = "postgresql+asyncpg://"
 
 
@@ -29,8 +31,22 @@ class Settings(BaseSettings):
     and the start gate refuses a permission that ends before the mission would, so keep this
     comfortably above the longest sortie you expect."""
 
-    # Only the in-memory link exists until the MQTT link is built (telemetry phase).
-    drone_link: Literal["in_memory"] = "in_memory"
+    # How commands reach drones: an in-memory stand-in (development, tests) or MQTT.
+    drone_link: Literal["in_memory", "mqtt"] = "in_memory"
+    mqtt_url: str = "mqtt://localhost:1883"
+    """The broker. Plain ``mqtt://`` only: no authentication or TLS has been requested."""
+
+    mqtt_ack_timeout_seconds: float = Field(default=10.0, gt=0)
+    """How long to wait for a drone to acknowledge a command before it counts as unanswered."""
+
+    mqtt_worker_client_id: str = "telemetry-worker"
+    """The telemetry worker's durable MQTT identity. Run exactly one worker per broker."""
+
+    @field_validator("mqtt_url")
+    @classmethod
+    def _require_mqtt_scheme(cls, value: str) -> str:
+        parse_mqtt_url(value)  # raises ValueError with a clear message
+        return value
 
     @field_validator("database_url")
     @classmethod

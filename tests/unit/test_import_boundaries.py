@@ -10,7 +10,15 @@ Layers and what each may import (besides the standard library):
                       ``app.db``, ``app.config``
 ``app/compliance``    ``app.domain``, ``app.compliance``
 ``app/dispatch``      structlog, ``app.domain``, ``app.compliance``, ``app.services``,
-                      ``app.dispatch``
+                      ``app.protocol``, ``app.dispatch``
+``app/protocol``      pydantic, ``app.domain``, ``app.protocol`` (the MQTT wire contract)
+``app/mqtt``          aiomqtt, structlog, ``app.mqtt`` (infrastructure: knows no domain)
+``app/telemetry``     structlog, ``app.domain``, ``app.protocol``, ``app.telemetry``, and
+                      from dispatch only ``app.dispatch.service`` / ``.progress``: no MQTT
+                      client, no link, no database
+``app/simulator``     structlog, ``app.domain``, ``app.protocol``, ``app.mqtt``,
+                      ``app.config``, ``app.logging``, ``app.simulator``: it plays a drone, so
+                      it knows nothing of dispatch or the database
 ``app/api``           FastAPI/Starlette/Pydantic/structlog, ``app.domain``,
                       ``app.services``, ``app.adapters``, ``app.api``, and from dispatch
                       only ``app.dispatch.service`` and ``app.dispatch.exceptions``
@@ -58,7 +66,39 @@ RULES: dict[str, LayerRule] = {
     # database layer, the HTTP layer or the partner adapters.
     "app/dispatch": LayerRule(
         frozenset({"structlog"}),
-        frozenset({"app.domain", "app.compliance", "app.services", "app.dispatch"}),
+        frozenset({"app.domain", "app.compliance", "app.services", "app.protocol", "app.dispatch"}),
+    ),
+    # The wire contract: pure data definitions shared by the link, the ingest and the simulator.
+    "app/protocol": LayerRule(frozenset({"pydantic"}), frozenset({"app.domain", "app.protocol"})),
+    # MQTT plumbing. It moves bytes between topics and handlers and knows nothing else.
+    "app/mqtt": LayerRule(frozenset({"aiomqtt", "structlog"}), frozenset({"app.mqtt"})),
+    # What drones report. It can decode events and call the dispatch service; it has no MQTT
+    # client (so it cannot publish a command) and no database layer (so it cannot write).
+    "app/telemetry": LayerRule(
+        frozenset({"structlog"}),
+        frozenset(
+            {
+                "app.domain",
+                "app.protocol",
+                "app.telemetry",
+                "app.dispatch.service",
+                "app.dispatch.progress",
+            }
+        ),
+    ),
+    # The drone side of the protocol. Not part of the platform: it must not know it.
+    "app/simulator": LayerRule(
+        frozenset({"structlog"}),
+        frozenset(
+            {
+                "app.domain",
+                "app.protocol",
+                "app.mqtt",
+                "app.config",
+                "app.logging",
+                "app.simulator",
+            }
+        ),
     ),
     # Handlers may call the dispatch service and render its errors, but never import the
     # drone link: the service is the only thing that may talk to a drone (Rule 1).
@@ -249,6 +289,102 @@ class TestTheDetectorItself:
     )
     def test_flags_the_compliance_package_reaching_beyond_the_domain(self, source: str) -> None:
         assert find_boundary_violations(source, RULES["app/compliance"]) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "import aiomqtt",  # dispatch talks to a drone through the port, never a client
+            "from app.mqtt.client import MqttClient",
+            "from app.telemetry.ingest import TelemetryIngest",
+            "from app.simulator.drone import SimulatedDrone",
+        ],
+    )
+    def test_flags_dispatch_reaching_mqtt_telemetry_or_the_simulator(self, source: str) -> None:
+        assert find_boundary_violations(source, RULES["app/dispatch"]) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "import aiomqtt",
+            "from app.mqtt.client import MqttClient",  # no client: it cannot publish
+            "from app.dispatch.link import DroneLink",  # no way to command a drone
+            "from app.dispatch.mqtt_link import MqttDroneLink",
+            "from app.db.uow import SqlAlchemyUnitOfWork",  # no database
+            "from app.services.order_service import OrderService",  # not even the services
+            "from app.simulator.drone import SimulatedDrone",
+            "import sqlalchemy",
+            "from fastapi import FastAPI",
+        ],
+    )
+    def test_flags_telemetry_reaching_for_a_broker_a_drone_or_the_database(
+        self, source: str
+    ) -> None:
+        assert find_boundary_violations(source, RULES["app/telemetry"]) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from app.dispatch.service import DispatchService",
+            "from app.dispatch.progress import ProgressEvent",
+            "from app.protocol.messages import decode_event",
+        ],
+    )
+    def test_allows_telemetry_to_use_the_dispatch_service_and_the_protocol(
+        self, source: str
+    ) -> None:
+        assert find_boundary_violations(source, RULES["app/telemetry"]) == []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from app.dispatch.service import DispatchService",  # a drone knows no platform
+            "from app.dispatch.link import DroneLink",
+            "from app.db.session import create_engine",
+            "from app.services.ports import UnitOfWork",
+            "from app.telemetry.ingest import TelemetryIngest",
+            "from app.compliance.interface import ComplianceProvider",
+            "import sqlalchemy",
+        ],
+    )
+    def test_flags_the_simulator_knowing_the_platform(self, source: str) -> None:
+        assert find_boundary_violations(source, RULES["app/simulator"]) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from app.dispatch.link import DroneLink",
+            "from app.services.order_service import OrderService",
+            "from app.mqtt.client import MqttClient",
+            "from app.telemetry.ingest import TelemetryIngest",
+            "from app.db.session import create_engine",
+        ],
+    )
+    def test_flags_the_protocol_depending_on_anything_but_the_domain(self, source: str) -> None:
+        assert find_boundary_violations(source, RULES["app/protocol"]) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from app.domain.models import Mission",
+            "from app.protocol.topics import command_topic",
+            "from pydantic import BaseModel",
+        ],
+    )
+    def test_allows_the_protocol_its_own_dependencies(self, source: str) -> None:
+        assert find_boundary_violations(source, RULES["app/protocol"]) == []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from app.domain.models import Order",
+            "from app.dispatch.service import DispatchService",
+            "from app.protocol.messages import encode",
+            "import paho.mqtt.client",
+            "import redis",
+        ],
+    )
+    def test_flags_the_mqtt_layer_knowing_anything_but_bytes(self, source: str) -> None:
+        assert find_boundary_violations(source, RULES["app/mqtt"]) != []
 
     def test_allows_dispatch_to_use_the_domain_compliance_and_service_ports(self) -> None:
         source = (

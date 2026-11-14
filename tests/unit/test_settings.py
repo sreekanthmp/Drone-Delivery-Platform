@@ -24,6 +24,9 @@ class TestDefaults:
             "LOG_JSON",
             "PERMISSION_VALIDITY_MINUTES",
             "DRONE_LINK",
+            "MQTT_URL",
+            "MQTT_ACK_TIMEOUT_SECONDS",
+            "MQTT_WORKER_CLIENT_ID",
         ):
             monkeypatch.delenv(name, raising=False)
 
@@ -38,6 +41,9 @@ class TestDefaults:
         assert settings.compliance_provider == "mock"
         assert settings.permission_validity_minutes == 60
         assert settings.drone_link == "in_memory"
+        assert settings.mqtt_url == "mqtt://localhost:1883"
+        assert settings.mqtt_ack_timeout_seconds == 10.0
+        assert settings.mqtt_worker_client_id == "telemetry-worker"
 
 
 class TestEnvironmentOverrides:
@@ -95,16 +101,45 @@ class TestCompliance:
 
 
 class TestDroneLink:
-    def test_only_the_in_memory_link_exists(self) -> None:
-        """The MQTT link is built with telemetry; nothing else may be selected until then."""
-        for link in ("mqtt", "real", "", "IN_MEMORY"):
-            with pytest.raises(ValidationError):
-                make(drone_link=link)
+    @pytest.mark.parametrize("link", ["in_memory", "mqtt"])
+    def test_the_in_memory_stand_in_and_mqtt_are_the_two_links(self, link: str) -> None:
+        assert make(drone_link=link).drone_link == link
+
+    @pytest.mark.parametrize("link", ["real", "http", "", "IN_MEMORY", "MQTT"])
+    def test_nothing_else_may_be_selected(self, link: str) -> None:
+        with pytest.raises(ValidationError):
+            make(drone_link=link)
 
     def test_it_comes_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("DRONE_LINK", "in_memory")
+        monkeypatch.setenv("DRONE_LINK", "mqtt")
 
-        assert make().drone_link == "in_memory"
+        assert make().drone_link == "mqtt"
+
+
+class TestMqtt:
+    def test_values_come_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MQTT_URL", "mqtt://mosquitto:1884")
+        monkeypatch.setenv("MQTT_ACK_TIMEOUT_SECONDS", "2.5")
+        monkeypatch.setenv("MQTT_WORKER_CLIENT_ID", "worker-7")
+
+        settings = make()
+
+        assert settings.mqtt_url == "mqtt://mosquitto:1884"
+        assert settings.mqtt_ack_timeout_seconds == 2.5
+        assert settings.mqtt_worker_client_id == "worker-7"
+
+    @pytest.mark.parametrize(
+        "url", ["localhost:1883", "http://x", "mqtts://x", "mqtt://", "tcp://x:1883", ""]
+    )
+    def test_the_url_must_be_a_plain_mqtt_url(self, url: str) -> None:
+        """No TLS or credentials have been requested, so nothing else is accepted."""
+        with pytest.raises(ValidationError, match="mqtt://"):
+            make(mqtt_url=url)
+
+    @pytest.mark.parametrize("seconds", ["0", "-1"])
+    def test_the_ack_timeout_must_be_positive(self, seconds: str) -> None:
+        with pytest.raises(ValidationError):
+            make(mqtt_ack_timeout_seconds=seconds)
 
 
 class TestValidation:

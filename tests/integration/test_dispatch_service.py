@@ -24,6 +24,7 @@ from app.dispatch.exceptions import (
     StartCommandFailedError,
 )
 from app.dispatch.link import CommandRejectedError, NoAcknowledgementError
+from app.dispatch.progress import ProgressEvent, ProgressOutcome
 from app.dispatch.service import DispatchOutcome, DispatchResult
 from app.domain.exceptions import PermissionRevokedError
 from app.domain.models import DroneStatus, EventSource, FlightStatus, OrderStatus
@@ -335,6 +336,65 @@ class TestFleetAgreesOnBothBackends:
             await rig.dispatch.confirm_docked(drone_id)
 
 
+class TestProgressAgreesOnBothBackends:
+    JOURNEY = (
+        ProgressEvent.PACKAGE_PICKED_UP,
+        ProgressEvent.DEPARTED_PICKUP,
+        ProgressEvent.ARRIVING_AT_DROPOFF,
+        ProgressEvent.PACKAGE_DELIVERED,
+    )
+
+    async def test_a_reported_journey_delivers_the_order_and_frees_the_drone(
+        self, rig: Rig
+    ) -> None:
+        result, drone_id = await dispatch_one(rig)
+        assert result.flight is not None
+        flight_id = result.flight.id
+
+        for event in self.JOURNEY:
+            assert (await rig.dispatch.record_progress(drone_id, flight_id, event)).applied
+        done = await rig.dispatch.record_progress(
+            drone_id, flight_id, ProgressEvent.MISSION_COMPLETED
+        )
+
+        assert done.applied
+        assert (await rig.order(result.order.id)).status is OrderStatus.DELIVERED
+        assert (await rig.dispatch.get_flight(flight_id)).status is S.COMPLETED
+        assert (await rig.drone(drone_id)).status is D.AVAILABLE
+        telemetry = [
+            e.new_state.value
+            for e in await rig.trail(result.order.id)
+            if e.source is EventSource.TELEMETRY
+        ]
+        assert telemetry == ["picked_up", "in_flight", "arriving", "delivered", "completed"]
+
+    async def test_repeats_and_skips_are_absorbed_or_refused(self, rig: Rig) -> None:
+        result, drone_id = await dispatch_one(rig)
+        assert result.flight is not None
+        record = rig.dispatch.record_progress
+
+        skipped = await record(drone_id, result.flight.id, ProgressEvent.PACKAGE_DELIVERED)
+        first = await record(drone_id, result.flight.id, ProgressEvent.PACKAGE_PICKED_UP)
+        again = await record(drone_id, result.flight.id, ProgressEvent.PACKAGE_PICKED_UP)
+
+        assert skipped.outcome is ProgressOutcome.REJECTED
+        assert first.outcome is ProgressOutcome.APPLIED
+        assert again.outcome is ProgressOutcome.ALREADY_APPLIED
+        assert (await rig.order(result.order.id)).status is OrderStatus.PICKED_UP
+
+    async def test_a_recalled_drone_docks(self, rig: Rig) -> None:
+        result, drone_id = await dispatch_one(rig)
+        assert result.flight is not None
+        await rig.dispatch.return_to_home(result.flight.id)
+
+        docked = await rig.dispatch.record_progress(
+            drone_id, result.flight.id, ProgressEvent.DOCKED
+        )
+
+        assert docked.applied
+        assert (await rig.drone(drone_id)).status is D.AVAILABLE
+
+
 # =============================================================================================
 # Real concurrency (PostgreSQL only)
 # =============================================================================================
@@ -441,3 +501,50 @@ class TestConcurrency:
         assert sum(1 for o in outcomes if not isinstance(o, BaseException)) == 1
         assert all(isinstance(o, DispatchError) for o in outcomes if isinstance(o, BaseException))
         assert len(await rig.dispatch.list_drones()) == 1
+
+    async def test_the_same_event_delivered_ten_times_at_once_applies_once(
+        self, pg_rig: Rig
+    ) -> None:
+        rig = pg_rig
+        result, drone_id = await dispatch_one(rig)
+        assert result.flight is not None
+
+        outcomes = await asyncio.gather(
+            *(
+                rig.dispatch.record_progress(
+                    drone_id, result.flight.id, ProgressEvent.PACKAGE_PICKED_UP
+                )
+                for _ in range(10)
+            )
+        )
+
+        counts = [o.outcome for o in outcomes]
+        assert counts.count(ProgressOutcome.APPLIED) == 1
+        assert counts.count(ProgressOutcome.ALREADY_APPLIED) == 9
+        picked_up = [
+            e for e in await rig.trail(result.order.id) if e.new_state is OrderStatus.PICKED_UP
+        ]
+        assert len(picked_up) == 1
+
+    @pytest.mark.parametrize("round_", range(6))
+    async def test_an_event_racing_a_cancellation_never_resurrects_the_order(
+        self, pg_rig: Rig, round_: int
+    ) -> None:
+        rig = pg_rig
+        result, drone_id = await dispatch_one(rig)
+        assert result.flight is not None
+
+        progress, cancelled = await asyncio.gather(
+            rig.dispatch.record_progress(
+                drone_id, result.flight.id, ProgressEvent.PACKAGE_PICKED_UP
+            ),
+            rig.dispatch.cancel_order(result.order.id, source=EventSource.API),
+            return_exceptions=True,
+        )
+
+        assert not isinstance(cancelled, BaseException), cancelled
+        assert not isinstance(progress, BaseException), progress
+        assert progress.outcome in {ProgressOutcome.APPLIED, ProgressOutcome.REJECTED}
+        assert (await rig.order(result.order.id)).status is OrderStatus.CANCELLED
+        assert all(not f.status.is_live for f in await rig.flights(result.order.id))
+        assert (await rig.drone(drone_id)).status in {D.RETURNING, D.AVAILABLE}

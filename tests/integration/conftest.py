@@ -200,3 +200,52 @@ def run_sql(engine: AsyncEngine) -> RunSql:
             return list(result.all()) if result.returns_rows else []
 
     return _run
+
+
+# --- MQTT: a real Mosquitto broker -----------------------------------------------------------
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+@pytest.fixture(scope="session")
+def mosquitto_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    """A throwaway Mosquitto broker on a free port (anonymous, localhost only).
+
+    Skipped with the reason when the binary is missing, unless ``REQUIRE_INTEGRATION=1``.
+    """
+    import shutil
+    import socket
+    import subprocess
+    import time
+
+    binary = shutil.which("mosquitto") or "/usr/sbin/mosquitto"
+    if not Path(binary).exists():
+        _unavailable("the mosquitto binary is not installed")
+        return
+    port = _free_port()
+    config = tmp_path_factory.mktemp("mosquitto") / "mosquitto.conf"
+    config.write_text(f"listener {port} 127.0.0.1\nallow_anonymous true\npersistence false\n")
+    process = subprocess.Popen(
+        [binary, "-c", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+                break
+            except OSError:
+                if process.poll() is not None or time.monotonic() > deadline:
+                    _unavailable("the mosquitto broker did not start")
+                    return
+                time.sleep(0.05)
+        yield f"mqtt://127.0.0.1:{port}"
+    finally:
+        process.terminate()
+        process.wait(timeout=10)

@@ -45,6 +45,7 @@ LINK_RECEIVER_HINT = "link"
 
 LINK_IMPORTERS = {
     "app/main.py",  # the composition root builds one and hands it to the service
+    "app/worker.py",  # the worker builds a DisabledDroneLink: a link that refuses everything
 }
 LINK_MODULES = {"app.dispatch.link", "app.dispatch.in_memory_link"}
 
@@ -446,3 +447,228 @@ class TestTheDetectorsThemselves:
             "        await self._link.start_mission(d, a)\n"
         )
         assert start_sent_before_the_gate(source) == []
+
+
+# =============================================================================================
+# MQTT: who may publish a command, who may touch a store (Rules 1 and 4)
+# =============================================================================================
+
+COMMAND_TOPIC_NAMES = {"command_topic", "parse_command_topic"}
+COMMAND_TOPIC_HOMES = {
+    "app/protocol/topics.py",  # defines them
+    "app/dispatch/mqtt_link.py",  # the one publisher of commands
+}
+COMMAND_TOPIC_PREFIXES = ("app/simulator/",)  # the drone side subscribes to them
+PUBLISHERS = {
+    "app/dispatch/mqtt_link.py",  # commands
+    "app/mqtt/client.py",  # the client's own publish
+    "app/simulator/runner.py",  # the drone's acknowledgements and events
+}
+COMMAND_CLASSES = {"UploadMission", "StartMission", "PauseMission", "ReturnToHome", "Land"}
+COMMAND_BUILDERS = {"app/dispatch/mqtt_link.py"}
+COMMAND_BUILDER_PREFIXES = ("app/simulator/",)  # only pattern-matches on them, but be lenient
+STORE_NAMES = {"orders", "flights", "drones", "audit", "uow", "UnitOfWork", "SqlAlchemyUnitOfWork"}
+
+
+def references_command_topics(source: str) -> list[str]:
+    found: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        name = (
+            node.id
+            if isinstance(node, ast.Name)
+            else node.attr
+            if isinstance(node, ast.Attribute)
+            else None
+        )
+        if name in COMMAND_TOPIC_NAMES:
+            found.append(f"line {node.lineno}: {name}")
+    return found
+
+
+def publishes(source: str) -> list[str]:
+    return [
+        f"line {node.lineno}"
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Attribute) and node.attr == "publish"
+    ]
+
+
+def builds_commands(source: str) -> list[str]:
+    found: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = (
+            func.id
+            if isinstance(func, ast.Name)
+            else func.attr
+            if isinstance(func, ast.Attribute)
+            else None
+        )
+        if name in COMMAND_CLASSES:
+            found.append(f"line {node.lineno}: {name}(...)")
+    return found
+
+
+def touches_stores(source: str) -> list[str]:
+    found: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        name = (
+            node.id
+            if isinstance(node, ast.Name)
+            else node.attr
+            if isinstance(node, ast.Attribute)
+            else node.name
+            if isinstance(node, ast.alias)
+            else None
+        )
+        if name is not None and (name.lstrip("_") in STORE_NAMES or "uow" in name.lower()):
+            found.append(f"line {getattr(node, 'lineno', '?')}: {name}")
+    return found
+
+
+def reaches_into_the_service(source: str) -> list[str]:
+    """Anything on ``self._dispatch`` other than ``record_progress`` (private or public)."""
+    found: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "_dispatch"
+            and node.attr != "record_progress"
+        ):
+            found.append(f"line {node.lineno}: _dispatch.{node.attr}")
+    return found
+
+
+def _allowed(path: Path, homes: set[str], prefixes: tuple[str, ...] = ()) -> bool:
+    relative = _relative(path)
+    return relative in homes or relative.startswith(prefixes)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [p for p in app_modules() if not _allowed(p, COMMAND_TOPIC_HOMES, COMMAND_TOPIC_PREFIXES)],
+    ids=_relative,
+)
+def test_only_the_mqtt_link_refers_to_the_command_topics(path: Path) -> None:
+    assert references_command_topics(path.read_text()) == []
+
+
+@pytest.mark.parametrize(
+    "path", [p for p in app_modules() if _relative(p) not in PUBLISHERS], ids=_relative
+)
+def test_only_the_mqtt_link_the_client_and_the_simulator_publish(path: Path) -> None:
+    assert publishes(path.read_text()) == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        p
+        for p in app_modules()
+        if _relative(p) not in COMMAND_BUILDERS
+        and _relative(p) != "app/protocol/messages.py"
+        and not _relative(p).startswith(COMMAND_BUILDER_PREFIXES)
+    ],
+    ids=_relative,
+)
+def test_only_the_mqtt_link_builds_a_command(path: Path) -> None:
+    assert builds_commands(path.read_text()) == []
+
+
+TELEMETRY_MODULES = [p for p in app_modules() if _relative(p).startswith("app/telemetry/")]
+
+
+@pytest.mark.parametrize("path", TELEMETRY_MODULES, ids=_relative)
+def test_the_telemetry_ingest_has_no_store_and_cannot_publish(path: Path) -> None:
+    """Rule 4: it writes nothing itself. Rule 1: it has no client to send a command with."""
+    source = path.read_text()
+
+    assert touches_stores(source) == []
+    assert reaches_into_the_service(source) == []
+    assert publishes(source) == []
+    assert references_command_topics(source) == []
+    assert builds_commands(source) == []
+
+
+def test_the_worker_hands_its_ingest_a_service_that_cannot_command_a_drone() -> None:
+    source = (ROOT / "app/worker.py").read_text()
+
+    assert "DisabledDroneLink()" in source
+    assert "DisabledCompliance()" in source
+    assert find_link_calls(source) == []
+    assert publishes(source) == []
+
+
+def test_the_telemetry_scan_sees_the_ingest() -> None:
+    assert len(TELEMETRY_MODULES) >= 2
+    assert any(_relative(p) == "app/telemetry/ingest.py" for p in TELEMETRY_MODULES)
+
+
+class TestTheMqttDetectorsThemselves:
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "t = command_topic(drone_id)",
+            "t = topics.command_topic(drone_id)",
+            "f = parse_command_topic",
+        ],
+    )
+    def test_flags_references_to_command_topics(self, source: str) -> None:
+        assert references_command_topics(source) != []
+
+    def test_allows_event_and_ack_topics(self) -> None:
+        assert references_command_topics("topics.event_topic(d); topics.ack_topic(i)") == []
+
+    @pytest.mark.parametrize(
+        "source", ["await client.publish(t, p)", "await self._mqtt.publish(t)"]
+    )
+    def test_flags_publishing(self, source: str) -> None:
+        assert publishes(source) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "wire.Land(**envelope)",
+            "UploadMission(mission=m)",
+            "messages.ReturnToHome()",
+            "PauseMission()",
+            "StartMission(authorization=a)",
+        ],
+    )
+    def test_flags_building_a_command(self, source: str) -> None:
+        assert builds_commands(source) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "uow.orders.get(i)",
+            "self._store.flights",
+            "from app.services.ports import UnitOfWork",
+            "x = drones",
+            "async with self._uow_factory() as uow: pass",
+        ],
+    )
+    def test_flags_touching_a_store(self, source: str) -> None:
+        assert touches_stores(source) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "self._dispatch._uow_factory()",  # a private route to the database
+            "self._dispatch._orders.transition(a, b)",
+            "x = self._dispatch._flights",
+            "self._dispatch.cancel_order(i)",  # a public method it has no business calling
+            "await self._dispatch.return_to_home(f)",
+        ],
+    )
+    def test_flags_reaching_past_record_progress(self, source: str) -> None:
+        assert touches_stores(source) != [] or reaches_into_the_service(source) != []
+
+    def test_the_ingest_may_call_record_progress_and_nothing_else(self) -> None:
+        assert reaches_into_the_service("await self._dispatch.record_progress(a, b, c)") == []
+
+    def test_allows_a_module_that_only_calls_the_service(self) -> None:
+        assert touches_stores("result = await self._dispatch.record_progress(a, b, c)") == []

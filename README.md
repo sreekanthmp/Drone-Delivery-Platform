@@ -217,9 +217,9 @@ a drone a position, heading, speed or status. A mission is a short list of high-
 sortie at fixed altitudes; the drone's own controller flies it. Failures are either
 *rejected* (the drone definitely did not act) or *no acknowledgement* (unknown: it may have).
 
-Only an **in-memory stand-in** exists (`DRONE_LINK=in_memory`): it behaves like a well-mannered
-drone (acknowledges uploads by checksum, checks the start authorisation) and can be told to
-fail, for tests. The MQTT link replaces it with telemetry in Phase 5.
+Two implementations: an **in-memory stand-in** (`DRONE_LINK=in_memory`, the default: it behaves
+like a well-mannered drone and can be told to fail, for tests) and the **MQTT link**
+(`DRONE_LINK=mqtt`, see [Telemetry and drones over MQTT](#telemetry-and-drones-over-mqtt)).
 
 ### The dispatch workflow (Rule 2)
 
@@ -297,18 +297,99 @@ cancelled**: the partner gets `503` (retry), because a cancelled order must neve
 drone flying. Cancelling an already-cancelled order is a no-op; a finished order (delivered,
 failed, returned) answers `409`.
 
-### Known limits of this phase
+### Known limits of dispatch (Phase 4B)
 
 - A crash between dispatch steps can leave a drone `assigned` and a flight live (there is no
   reaper). Cancelling the order, or `docked` once the flight is over, releases it.
-- After a recall or landing the drone stays `returning`/`offline` until operations calls
-  `docked` (nothing reports its position until telemetry exists in Phase 5).
+- After a recall the drone stays `returning` until it reports `docked` (the telemetry worker
+  records it; without a worker, operations calls `docked`). After a `land` it stays `offline`
+  until it is recovered and reports `docked`, or operations calls `docked`.
 - A refused or failed command is **logged**, not audited: the audit trail records status
   changes, and a command that changed nothing is in the structured log.
 - A cancelled flight's mission may remain on the drone until the next upload replaces it
   (there is deliberately no "clear mission" command).
 - The database gate cannot see the provider re-check and uses the database clock (see above).
 - Still no authentication, billing or real Digital Sky integration (none has been requested).
+
+## Telemetry and drones over MQTT
+
+Phase 5A. Drones are separate machines that fly missions on their own, so the platform talks to
+them over **MQTT** (Mosquitto in compose), and a separate **worker process** records what they
+report. The wire contract lives in `app/protocol` (validated models and every topic name), shared
+by the link, the worker and the simulator so none depends on another.
+
+```
+API process                         broker                       drone (or simulator)
+ MqttDroneLink --- drones/{id}/commands --->               --->  checks, then acts
+               <-- platform/acks/{instance} ---            <---  acknowledges (matched by command_id)
+                                    drones/{id}/events <---       reports progress
+ telemetry worker  <------------------------------------
+   TelemetryIngest -> DispatchService.record_progress -> OrderService / state machines
+```
+
+**Commands** (`DRONE_LINK=mqtt`). Each carries a `command_id`, and the drone answers on the reply
+topic named in the command, so any number of API processes can share one broker. A start carries
+the Rule 2 authorisation (flight, permission, mission checksum, expiry), which the drone checks
+itself. The failure kinds map onto the two the service already understands: **no connection** to
+the broker means the command was *definitely not sent* (rejected); **no acknowledgement in time**
+(`MQTT_ACK_TIMEOUT_SECONDS`) or a publish that failed part-way means *unknown*.
+`GET /ready` fails while the API is not connected to the broker.
+
+**Events** (drone -> platform, QoS 1, durable session). A drone reports what happened, never what
+to do. Each event applies at most one change, only if it fits, and never invents a missing step:
+
+| Event | Effect |
+|---|---|
+| `package_picked_up` | order `assigned -> picked_up` |
+| `departed_pickup` | order `picked_up -> in_flight` |
+| `arriving_at_dropoff` | order `in_flight -> arriving` |
+| `package_delivered` | order `arriving -> delivered` |
+| `mission_completed` | flight `started -> completed`, drone `on_mission -> available` (no manual `docked` needed) |
+| `docked` | a recalled (`returning`) or grounded (`offline`) drone becomes `available` |
+| `fault` | logged as an error; **nothing changes and nothing is sent** (alerts only: any automatic recall is a policy decision for later) |
+
+Every event carries a per-flight sequence number. A repeat or an older one is dropped (and
+counted) before it touches anything; MQTT delivers at least once, and an event whose effect is
+already recorded is "already applied", which also covers a worker restart. An event that does not
+fit (a delivery for an order that was never picked up, a flight that is not flying, another
+drone's flight, a cancelled order) is rejected and logged. Applied events are audited with
+source `telemetry`; the audit keeps the event name, flight and time, never the drone's free text.
+
+**Rule 1 and 4 on this path.** The worker's dispatch service is built with a link and a
+compliance provider that refuse everything, so that process *cannot* command a drone or request
+permission even through a bug. The ingest has no MQTT client and no store (architecture tests
+prove it), only the dispatch service, which is still the only writer of flights and drones. Only
+the MQTT link publishes to command topics.
+
+### The worker and the simulator
+
+```bash
+python -m app.worker                      # run exactly ONE worker per broker (durable session)
+python -m app.simulator --api-url http://localhost:8000 --fleet 3 --speed-factor 30
+```
+
+The **simulator** (`app/simulator`) plays drones: it registers `sim-1..N` with the API (or takes
+`--drone-id`), receives the same five commands, recomputes the mission checksum and refuses an
+expired, mis-addressed or mismatched authorisation as a real drone should, flies the mission on a
+fast-forwardable clock, and reports events (queued and retried in order if the broker blinks). It
+is a development and test tool, not part of the platform.
+
+```bash
+docker compose up --build                       # API + worker + Postgres + Mosquitto
+docker compose --profile simulator up --build   # ...plus three simulated drones
+```
+
+### Known limits of the MQTT phase (5A)
+
+- **No auth or TLS on the broker** (none was requested): the dev `mosquitto.conf` accepts anonymous
+  connections. Do not expose it, and do not point real drones at it as it is.
+- A drone's own failsafe (it aborts and lands by itself) is not reported yet, so the platform would
+  still think it is flying; nothing in this phase detects a silent or lost drone. Heartbeats,
+  alerts and a reaper for stale reservations arrive with live tracking (Phase 5B).
+- A worker outage longer than its retry window (about 8 s of failing database calls) loses the event
+  it was handling, because the broker has already been acknowledged; events sent while the worker
+  is merely *away* are kept by the durable session. Run one worker only.
+- Telemetry samples (position, battery), Redis and WebSockets are Phase 5B.
 
 ## Development
 
@@ -324,7 +405,7 @@ uv run alembic upgrade head  # create the schema
 
 ```bash
 uv run pytest                # all tests
-uv run pytest -m "not integration"   # only tests that need no database
+uv run pytest -m "not integration"   # only tests that need no database or broker
 uv run ruff check .          # lint
 uv run ruff format --check . # formatting
 uv run mypy                  # strict type-check of app/
@@ -338,6 +419,10 @@ uv run uvicorn app.main:create_app --factory --reload   # needs the database fro
 docker compose up --build
 ```
 
+With `DRONE_LINK=mqtt` (the compose default) the API needs the broker and something playing the
+drones, or a dispatch ends in `upload_failed: no acknowledgement`. For local development without
+a broker, keep the default `DRONE_LINK=in_memory`.
+
 Interactive docs are at `http://localhost:8000/docs`. Example:
 
 ```bash
@@ -350,7 +435,8 @@ curl -X POST localhost:8000/partner/mock/orders -H 'content-type: application/js
 
 ### Integration tests
 
-Tests marked `integration` need PostgreSQL with PostGIS. A migrated template database is
+Tests marked `integration` need PostgreSQL with PostGIS and, for the MQTT tests, a `mosquitto`
+binary (each run starts its own throwaway broker on a free port). A migrated template database is
 created once per run and every test gets its own throwaway clone, so tests never share
 state. Configure the admin connection with `TEST_DATABASE_ADMIN_URL` (default
 `postgresql://drone:drone@localhost:5432/postgres`; the role needs `CREATEDB` and permission
@@ -369,7 +455,8 @@ database can never look like a green run.
 | 3 | Client adapters (mock, Swiggy, Zomato) and order API, Dockerfile | **done** |
 | 4A | Drones, compliance (mock Digital Sky) and the flight lifecycle: flight state machine with the Rule 2 start gate, drone selection, drone/flight persistence and database guards | **done** |
 | 4B | Dispatch workflow, mission planner, drone link (start/pause/RTH/land), cancellation, internal dispatch API | **done** |
-| 5 | Telemetry: MQTT ingest, Redis, WebSockets, drone simulator | planned |
+| 5A | MQTT drone link and wire contract, drone-reported progress events, telemetry worker, drone simulator, Mosquitto in compose | **done** |
+| 5B | Telemetry samples, Redis, WebSocket tracking streams, heartbeats and alerts, reaper for stale reservations | planned |
 | 6 | Webhooks: sender, retries, idempotency, failure tracking | planned |
 | 7 | Ops dashboard APIs, hardening, end-to-end tests | planned |
 
@@ -458,3 +545,19 @@ database can never look like a green run.
 - [2026-11-14] Partner cancellation maps a finished order to a new `CONFLICT` (409) error kind and an unconfirmed recall to `UNAVAILABLE` (503), rendered by every adapter in its own format: partners learn what to do (stop, or retry) without seeing internals.
 - [2026-11-14] Only an in-memory drone link exists (`DRONE_LINK=in_memory`): the MQTT link arrives with telemetry in Phase 5, and nothing that would pretend to reach a real drone is built before then.
 - [2026-11-14] Dispatch locks the order row while it decides, so a concurrent dispatch and cancel (or ten dispatches) of one order are serialised by the database; the one-live-flight indexes remain the backstop, and a mutation check showed that removing the lock is caught by the concurrent HTTP test.
+- [2026-11-14] Phase 5 is split into 5A (MQTT link, drone-reported events, worker, simulator) and 5B (telemetry samples, Redis, WebSockets, heartbeats, reaper) (user-approved): the command and progress path is one reviewable unit and live tracking another.
+- [2026-11-14] Order progress comes from drone-reported mission events, never from the cloud inferring it from GPS positions (user-approved): geofence inference is brittle, while an event is idempotent and auditable.
+- [2026-11-14] The telemetry ingest runs as its own worker process, exactly one per broker (user-approved): it must not die with an API worker, and MQTT 3.1.1 has no shared subscriptions, so two workers with one identity would take the session from each other.
+- [2026-11-14] The platform uses `aiomqtt` with Mosquitto: QoS 1 for commands, acknowledgements and events, a durable session for the worker so events sent while it is away are kept, and acknowledgements on a per-process reply topic named in each command, so any number of API processes can share a broker without receiving each other's answers (user-approved).
+- [2026-11-14] A drone fault is an alert only: it is logged as an error and nothing changes and nothing is sent (user-approved): whether the cloud should automatically recall a drone is a safety policy for the user to decide, not a side effect of a log line.
+- [2026-11-14] No position history table and no migration in Phase 5 (user-approved): the audit log records status changes (Rule 5), and live position and battery belong in Redis in 5B.
+- [2026-11-14] The broker has no authentication or TLS and the dev config says so (user-approved): consistent with not introducing auth until requested; it must not face real drones as it is.
+- [2026-11-14] The wire contract is its own `app/protocol` layer rather than part of `app/telemetry`: the link (sends), the ingest (reads) and the simulator (plays the drone) all need it and none should depend on another.
+- [2026-11-14] A drone reports four order-progress events (picked up, departed, arriving, delivered) instead of fewer: the order state machine allows one forward step at a time, and replaying two steps from one event would record `arriving` as if it happened at the same instant as `in_flight`.
+- [2026-11-14] Events carry a per-flight sequence number: a repeat or older event is dropped before it touches anything, a gap is logged, and an event that does not fit is rejected, never completed by inventing the missing steps: history must not be fabricated to make a state machine happy.
+- [2026-11-14] The worker's dispatch service is built with a link and a compliance provider that refuse everything (`DisabledDroneLink`, `DisabledCompliance`), and the ingest has no MQTT client and no store: that process cannot command a drone or write a status even through a bug (Rules 1 and 4), and architecture tests keep it so.
+- [2026-11-14] The MQTT link maps "no connection to the broker" to a rejection (the command was definitely not sent) and "published but unacknowledged" or "publish failed part-way" to no-acknowledgement (unknown): the service recovers differently from each, and a timeout must never be read as "it did not happen".
+- [2026-11-14] `mission_completed` ends the flight and frees the drone automatically, and `docked` frees a recalled or grounded one; manual `docked` stays as the fallback. A completion with no reported delivery is applied but warned about, and the order is left alone: the platform does not guess an order's fate.
+- [2026-11-14] Audit metadata for telemetry-driven changes keeps only the event name, flight id and time, never the drone's free-form detail: a drone is an untrusted source and its text should not be able to bloat or pollute the append-only log.
+- [2026-11-14] If recording an event keeps failing past a short retry window (about 8 s), the event is lost: the broker was already acknowledged and aiomqtt offers no manual acknowledgement. Accepted for 5A, documented, and revisited with heartbeats and reconciliation in 5B.
+- [2026-11-14] The simulator behaves like a drone that does not trust the cloud (it recomputes the checksum, refuses an expired, mis-addressed or mismatched authorisation) and only ever answers on platform reply topics, whatever a command's `reply_to` says: a test double that is more trusting than a real drone would hide Rule 2 bugs.
