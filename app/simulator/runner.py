@@ -25,11 +25,19 @@ logger = structlog.get_logger(__name__)
 
 class SimulatorRunner:
     def __init__(
-        self, drones: Sequence[SimulatedDrone], client: MqttClient, *, tick_s: float = 0.05
+        self,
+        drones: Sequence[SimulatedDrone],
+        client: MqttClient,
+        *,
+        tick_s: float = 0.05,
+        telemetry_interval_s: float = 1.0,
     ) -> None:
         self._drones = {drone.drone_id: drone for drone in drones}
         self._client = client
         self._tick_s = tick_s
+        self._telemetry_interval_s = telemetry_interval_s
+        self.muted: set[UUID] = set()
+        """Drones whose telemetry is held back (a way for tests to simulate a lost link)."""
         self._outbox: dict[UUID, deque[bytes]] = {drone_id: deque() for drone_id in self._drones}
 
     async def run(self) -> None:
@@ -83,13 +91,28 @@ class SimulatorRunner:
     async def _tick_forever(self) -> None:
         loop = asyncio.get_running_loop()
         last = loop.time()
+        last_sample = float("-inf")
         while True:
             await asyncio.sleep(self._tick_s)
             now = loop.time()
             elapsed, last = now - last, now
+            sampling = now - last_sample >= self._telemetry_interval_s
+            if sampling:
+                last_sample = now
             for drone in self._drones.values():
                 self.report(drone, drone.advance(elapsed))
                 await self._flush(drone.drone_id)
+                if sampling and drone.drone_id not in self.muted:
+                    await self._sample(drone)
+
+    async def _sample(self, drone: SimulatedDrone) -> None:
+        """Send one telemetry sample. QoS 0: a lost one is simply a gap in the picture."""
+        try:
+            await self._client.publish(
+                topics.telemetry_topic(drone.drone_id), wire.encode(drone.sample()), qos=0
+            )
+        except Exception as error:
+            logger.debug("sample_dropped", drone_id=str(drone.drone_id), error=repr(error))
 
     async def _flush(self, drone_id: UUID) -> None:
         queue = self._outbox[drone_id]

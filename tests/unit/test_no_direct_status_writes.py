@@ -76,7 +76,7 @@ STORE_WRITE_HOMES: dict[str, set[str]] = {
 STORE_WRITE_METHODS: dict[str, set[str]] = {
     "orders": {"insert", "apply_transition"},
     "flights": {"insert", "apply_transition"},
-    "drones": {"add", "apply_status_change"},
+    "drones": {"add", "apply_status_change", "set_battery"},
 }
 # Only the flight state machine may mint the token that authorises a flight to start.
 START_AUTHORIZATION_HOME = "app/domain/flight_state_machine.py"

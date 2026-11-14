@@ -5,6 +5,7 @@ This module and the migration are the only places that write drone rows.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -94,6 +95,15 @@ class SqlAlchemyDroneStore:
         if lock:
             statement = statement.with_for_update(skip_locked=True)
         return [_to_domain(row) for row in (await self._session.execute(statement)).all()]
+
+    async def set_battery(self, drone_id: UUID, battery_percent: float, *, now: datetime) -> bool:
+        outcome = await self._session.execute(
+            update(DroneRecord)
+            .where(DroneRecord.id == drone_id)
+            .values(battery_percent=battery_percent, updated_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        return cast("CursorResult[Any]", outcome).rowcount == 1
 
     async def apply_status_change(self, before: Drone, after: Drone) -> None:
         check_status_change(before, after)

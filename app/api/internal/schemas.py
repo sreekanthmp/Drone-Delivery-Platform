@@ -20,6 +20,7 @@ from app.domain.models import (
     Package,
     PermissionDenial,
 )
+from app.realtime.models import Alert
 
 
 class LocationOut(BaseModel):
@@ -262,4 +263,45 @@ class DispatchOut(BaseModel):
                 for drone_id, reasons in result.rejections.items()
             },
             detail=result.detail,
+        )
+
+
+# --- alerts ----------------------------------------------------------------------------------
+
+
+class AlertOut(BaseModel):
+    kind: str
+    drone_id: UUID | None
+    flight_id: UUID | None
+    order_id: UUID | None
+    message: str
+    raised_at: datetime
+    resolved_at: datetime | None
+
+    @classmethod
+    def from_domain(cls, alert: Alert) -> AlertOut:
+        return cls(
+            kind=alert.kind.value,
+            drone_id=alert.drone_id,
+            flight_id=alert.flight_id,
+            order_id=alert.order_id,
+            message=alert.message,
+            raised_at=alert.raised_at,
+            resolved_at=alert.resolved_at,
+        )
+
+
+class AlertsOut(BaseModel):
+    live: bool
+    """False when no live view (Redis) is configured: there is nothing to report."""
+
+    active: list[AlertOut]
+    recent: list[AlertOut]
+
+    @classmethod
+    def of(cls, active: list[Alert], recent: list[Alert]) -> AlertsOut:
+        return cls(
+            live=True,
+            active=[AlertOut.from_domain(a) for a in active],
+            recent=[AlertOut.from_domain(a) for a in recent],
         )

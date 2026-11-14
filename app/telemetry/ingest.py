@@ -23,9 +23,11 @@ from uuid import UUID
 
 import structlog
 
-from app.dispatch.progress import ProgressEvent, ProgressResult
+from app.dispatch.progress import ProgressEvent, ProgressOutcome, ProgressResult
 from app.dispatch.service import DispatchService
-from app.protocol.messages import DroneEvent, ProtocolError, decode_event
+from app.protocol.messages import DroneEvent, EventType, ProtocolError, decode_event
+from app.realtime.models import Alert, AlertKind
+from app.realtime.ports import AlertBoard
 
 logger = structlog.get_logger(__name__)
 
@@ -64,11 +66,13 @@ class TelemetryIngest:
         self,
         dispatch: DispatchService,
         *,
+        alerts: AlertBoard | None = None,
         max_tracked_flights: int = 10_000,
         retry_delays: tuple[float, ...] = _RETRY_DELAYS,
         sleep: Callable[[float], Awaitable[None]] = _sleep,
     ) -> None:
         self._dispatch = dispatch
+        self._alerts = alerts
         self._last_seq: dict[UUID, int] = {}  # insertion-ordered: oldest first
         self._max_tracked = max_tracked_flights
         self._retry_delays = retry_delays
@@ -120,6 +124,8 @@ class TelemetryIngest:
             return IngestResult(IngestOutcome.FAILED, repr(error))
 
         self._remember(event.flight_id, event.seq)
+        if event.type is EventType.FAULT and progress.outcome is ProgressOutcome.NOTED:
+            await self._announce_fault(drone_id, event)
         return IngestResult(IngestOutcome(progress.outcome.value), progress.reason)
 
     async def _record(self, drone_id: UUID, event: DroneEvent) -> ProgressResult:
@@ -141,6 +147,25 @@ class TelemetryIngest:
                 )
                 await self._sleep(delay)
         raise AssertionError("unreachable")  # pragma: no cover
+
+    async def _announce_fault(self, drone_id: UUID, event: DroneEvent) -> None:
+        """Make a fault visible to operations (an alert only: nothing is commanded)."""
+        if self._alerts is None:
+            return
+        code = str(event.detail.get("code", "unknown"))[:60]
+        text = str(event.detail.get("message", ""))[:200]
+        try:
+            await self._alerts.notify(
+                Alert(
+                    kind=AlertKind.FAULT,
+                    drone_id=drone_id,
+                    flight_id=event.flight_id,
+                    message=f"{code}: {text}" if text else code,
+                    raised_at=event.occurred_at,
+                )
+            )
+        except Exception as error:  # the alert board is a view; the fault is already logged
+            logger.warning("fault_alert_failed", error=repr(error))
 
     def _remember(self, flight_id: UUID, seq: int) -> None:
         self._last_seq.pop(flight_id, None)  # re-insert so the most recent flight is last

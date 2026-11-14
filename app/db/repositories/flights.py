@@ -8,6 +8,7 @@ the audit event is written in the same transaction.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -130,6 +131,32 @@ class SqlAlchemyFlightStore:
             )
         ).one_or_none()
         return None if record is None else _to_domain(record)
+
+    async def list_live(self) -> list[Flight]:
+        records = await self._session.scalars(
+            select(FlightRecord)
+            .where(FlightRecord.status.in_([status.value for status in LIVE_FLIGHT_STATES]))
+            .order_by(FlightRecord.created_at, FlightRecord.id)
+            .execution_options(populate_existing=True)
+        )
+        return [_to_domain(record) for record in records]
+
+    async def list_stale_preflight(self, updated_before: datetime) -> list[Flight]:
+        preflight = (
+            FlightStatus.PLANNED,
+            FlightStatus.PERMISSION_GRANTED,
+            FlightStatus.MISSION_UPLOADED,
+        )
+        records = await self._session.scalars(
+            select(FlightRecord)
+            .where(
+                FlightRecord.status.in_([status.value for status in preflight]),
+                FlightRecord.updated_at < updated_before,
+            )
+            .order_by(FlightRecord.updated_at, FlightRecord.id)
+            .execution_options(populate_existing=True)
+        )
+        return [_to_domain(record) for record in records]
 
     async def insert(self, result: FlightTransitionResult) -> bool:
         flight, event = result.flight, result.audit_event

@@ -375,21 +375,61 @@ fast-forwardable clock, and reports events (queued and retried in order if the b
 is a development and test tool, not part of the platform.
 
 ```bash
-docker compose up --build                       # API + worker + Postgres + Mosquitto
+docker compose up --build                       # API + worker + Postgres + Mosquitto + Redis
 docker compose --profile simulator up --build   # ...plus three simulated drones
 ```
 
-### Known limits of the MQTT phase (5A)
+## Live tracking: samples, alerts and the reaper
 
-- **No auth or TLS on the broker** (none was requested): the dev `mosquitto.conf` accepts anonymous
-  connections. Do not expose it, and do not point real drones at it as it is.
-- A drone's own failsafe (it aborts and lands by itself) is not reported yet, so the platform would
-  still think it is flying; nothing in this phase detects a silent or lost drone. Heartbeats,
-  alerts and a reaper for stale reservations arrive with live tracking (Phase 5B).
+Phase 5B. Drones also send **telemetry samples** (position, altitude, battery, their own phase,
+about once a second, QoS 0; each doubles as a heartbeat). The worker keeps the picture live in
+**Redis** and watches it. Redis is a **view, never the source of truth**: the latest state, the
+alerts and the stream of changes live there and can be lost and rebuilt; every status is in
+PostgreSQL and is written only through the services (Rule 4). Leave `REDIS_URL` unset, or lose
+Redis, and dispatch, commands, events and the audit trail work exactly the same: only live
+tracking goes away (`GET /internal/alerts` then answers `live: false`, or `503`).
+
+| What | How |
+|---|---|
+| **Latest state** | each sample from a *registered* drone is stored under `state:{id}` with a TTL and broadcast on `ch:drone:{id}` and `ch:fleet` (droppable). Samples from unknown drones are ignored, so strangers cannot fill Redis |
+| **Battery** | the *stored* battery follows the drone's in 5-point steps through `DispatchService.record_battery`, because drone selection reads the stored value (before this it stayed at its registration value forever) |
+| **Change feed** | after a transition commits, `OrderService` and `DispatchService` hand the *committed* audit events to an optional notifier, which publishes a small summary to `ch:order:{id}` and `ch:fleet`. Best-effort: it never raises, so it cannot fail or roll back the change it reports |
+| **Alerts** | standing alerts are raised once and announced as resolved when the cause goes; one-offs (a fault, a reaped reservation) are only recorded. `GET /internal/alerts` shows both |
+
+**The watchdog** (alerts only, every 5 s) compares the platform's live flights with the drones'
+samples:
+
+| Alert | When |
+|---|---|
+| `link_lost` | a flight that is `started` or `paused`, and no sample for 15 s (judged by the platform's receive time, never the drone's clock) |
+| `low_battery` | a drone in the air below 20% |
+| `state_mismatch` | the platform has the flight in the air but the drone reports idle, landed or ready, or the drone reports flying but the platform has no live flight, for over 30 s. This is how a lost `mission_completed` or a failsafe landing becomes visible |
+| `fault` | the drone reported a fault |
+
+**It never sends a command and never changes a status.** Deciding that a drone should be
+recalled is a safety policy for a person, so an alert is information and nothing acts on it. It
+holds no link and no stores, only the read side of the dispatch service and the live view.
+
+**The reaper** (every 60 s) cancels flights that a crashed dispatch left half-finished, so a
+drone is not reserved forever: `planned` or `permission_granted` flights older than 5 minutes,
+and `mission_uploaded` flights whose order is still `created` (the crash window between upload
+and assignment). The cancellation goes through the dispatch service, is audited (source
+`system`), frees the drone, and leaves the order `created` and retryable; each release is
+announced as an alert. It **never** touches a staged flight on an `assigned` order (that is
+deliberate), nor any flight that has started: a silent drone in the air is for a person.
+
+### Known limits (MQTT and live tracking)
+
+- **No auth or TLS on the broker or Redis** (none was requested): the dev configs accept anonymous
+  connections. Do not expose them, and do not point real drones at them as they are.
+- The platform only learns what a drone reports. A drone that goes silent, or fails over on its
+  own, is *detected* (alerts) but not *handled*: a person decides whether to recall or cancel.
 - A worker outage longer than its retry window (about 8 s of failing database calls) loses the event
   it was handling, because the broker has already been acknowledged; events sent while the worker
-  is merely *away* are kept by the durable session. Run one worker only.
-- Telemetry samples (position, battery), Redis and WebSockets are Phase 5B.
+  is merely *away* are kept by the durable session. Run one worker only. The `state_mismatch` alert
+  is the safety net for a lost `mission_completed`.
+- Redis pub/sub is fire-and-forget: a watcher that misses a message re-syncs from a snapshot.
+- Standing alerts are raised again once after a Redis wipe (they are rebuilt from the next pass).
 
 ## Development
 
@@ -435,8 +475,9 @@ curl -X POST localhost:8000/partner/mock/orders -H 'content-type: application/js
 
 ### Integration tests
 
-Tests marked `integration` need PostgreSQL with PostGIS and, for the MQTT tests, a `mosquitto`
-binary (each run starts its own throwaway broker on a free port). A migrated template database is
+Tests marked `integration` need PostgreSQL with PostGIS and, for the MQTT and live-view tests, the
+`mosquitto` and `redis-server` binaries (each run starts its own throwaway broker and Redis on free
+ports). A migrated template database is
 created once per run and every test gets its own throwaway clone, so tests never share
 state. Configure the admin connection with `TEST_DATABASE_ADMIN_URL` (default
 `postgresql://drone:drone@localhost:5432/postgres`; the role needs `CREATEDB` and permission
@@ -456,7 +497,7 @@ database can never look like a green run.
 | 4A | Drones, compliance (mock Digital Sky) and the flight lifecycle: flight state machine with the Rule 2 start gate, drone selection, drone/flight persistence and database guards | **done** |
 | 4B | Dispatch workflow, mission planner, drone link (start/pause/RTH/land), cancellation, internal dispatch API | **done** |
 | 5A | MQTT drone link and wire contract, drone-reported progress events, telemetry worker, drone simulator, Mosquitto in compose | **done** |
-| 5B | Telemetry samples, Redis, WebSocket tracking streams, heartbeats and alerts, reaper for stale reservations | planned |
+| 5B | Telemetry samples, Redis, heartbeats and alerts, reaper for stale reservations (done); WebSocket tracking streams (next) | **in progress** |
 | 6 | Webhooks: sender, retries, idempotency, failure tracking | planned |
 | 7 | Ops dashboard APIs, hardening, end-to-end tests | planned |
 
@@ -561,3 +602,15 @@ database can never look like a green run.
 - [2026-11-14] Audit metadata for telemetry-driven changes keeps only the event name, flight id and time, never the drone's free-form detail: a drone is an untrusted source and its text should not be able to bloat or pollute the append-only log.
 - [2026-11-14] If recording an event keeps failing past a short retry window (about 8 s), the event is lost: the broker was already acknowledged and aiomqtt offers no manual acknowledgement. Accepted for 5A, documented, and revisited with heartbeats and reconciliation in 5B.
 - [2026-11-14] The simulator behaves like a drone that does not trust the cloud (it recomputes the checksum, refuses an expired, mis-addressed or mismatched authorisation) and only ever answers on platform reply topics, whatever a command's `reply_to` says: a test double that is more trusting than a real drone would hide Rule 2 bugs.
+- [2026-11-14] Phase 5B is delivered as two commits under one approval: the telemetry backend (samples, Redis, battery sync, watchdog, reaper) and then the live streams (user-approved).
+- [2026-11-14] The stored battery follows the drone's in 5-point steps through the dispatch service, with no migration (user-approved): drone selection reads the stored value, which otherwise stayed at its registration value for ever and made the battery rule meaningless.
+- [2026-11-14] The reaper cancels only flights that never took off (`planned`, `permission_granted`, and `mission_uploaded` on an order still `created`), older than 5 minutes (user-approved): a staged flight on an `assigned` order is deliberate, and a silent drone in the air is an alert for a person, never a reaper's decision.
+- [2026-11-14] No alert triggers a command (user-approved, reaffirming the Phase 5 decision): the watchdog has no link and no stores, and a test proves it changes no status and sends nothing across every alert it can raise.
+- [2026-11-14] Redis is a view, never the source of truth, and `/ready` does not depend on it (user-approved): losing it costs live tracking and alerts, not dispatch, recording or the audit trail, and an end-to-end test delivers an order with Redis unreachable.
+- [2026-11-14] Committed changes are announced through an optional notifier that receives the audit events after the commit and never raises: a view must not be able to fail or roll back the change it reports, and what is announced is exactly what the audit trail holds.
+- [2026-11-14] Samples are judged fresh by the platform's receive time, never the drone's clock: a drone with a wrong clock must not look silent, or look alive when it is not. The drone's own timestamp is kept for ordering only.
+- [2026-11-14] The recorder ignores telemetry from drones that are not registered, with the lookup (and refusals) cached and bounded: the broker is unauthenticated, so strangers must not be able to fill Redis or grow memory.
+- [2026-11-14] The `state_mismatch` alert needs the disagreement to persist for a grace period (30 s), and `link_lost` is judged from the flight's last change when no sample was ever received: events and samples legitimately disagree for a moment, and a flight that just started needs time to send its first sample.
+- [2026-11-14] The state TTL (60 s) is longer than the link-lost threshold (15 s) by design, and a settings test pins it: otherwise a silent drone would simply vanish from the view instead of raising an alert.
+- [2026-11-14] The Rule 1 "who may publish" scan now looks for MQTT-shaped receivers rather than every `.publish`: Redis broadcasts are views for people, not messages to drones, and the layer rules already confine MQTT clients to the modules allowed to import one.
+- [2026-11-14] Each telemetry module has an explicit allow-list of the dispatch-service methods it may call (the ingest only `record_progress`, the recorder only `drone_exists` and `record_battery`, ...), checked by an architecture test: a private route to the database or a command from the telemetry side is a test failure.

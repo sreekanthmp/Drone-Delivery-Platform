@@ -13,9 +13,11 @@ Layers and what each may import (besides the standard library):
                       ``app.protocol``, ``app.dispatch``
 ``app/protocol``      pydantic, ``app.domain``, ``app.protocol`` (the MQTT wire contract)
 ``app/mqtt``          aiomqtt, structlog, ``app.mqtt`` (infrastructure: knows no domain)
-``app/telemetry``     structlog, ``app.domain``, ``app.protocol``, ``app.telemetry``, and
-                      from dispatch only ``app.dispatch.service`` / ``.progress``: no MQTT
-                      client, no link, no database
+``app/realtime``      redis, pydantic, structlog, ``app.domain``, ``app.protocol``,
+                      ``app.realtime`` (the live view: a view, never the source of truth)
+``app/telemetry``     structlog, ``app.domain``, ``app.protocol``, ``app.realtime``,
+                      ``app.telemetry``, and from dispatch only ``app.dispatch.service`` /
+                      ``.progress``: no MQTT client, no link, no database
 ``app/simulator``     structlog, ``app.domain``, ``app.protocol``, ``app.mqtt``,
                       ``app.config``, ``app.logging``, ``app.simulator``: it plays a drone, so
                       it knows nothing of dispatch or the database
@@ -72,14 +74,21 @@ RULES: dict[str, LayerRule] = {
     "app/protocol": LayerRule(frozenset({"pydantic"}), frozenset({"app.domain", "app.protocol"})),
     # MQTT plumbing. It moves bytes between topics and handlers and knows nothing else.
     "app/mqtt": LayerRule(frozenset({"aiomqtt", "structlog"}), frozenset({"app.mqtt"})),
-    # What drones report. It can decode events and call the dispatch service; it has no MQTT
-    # client (so it cannot publish a command) and no database layer (so it cannot write).
+    # The live view on Redis. It knows the domain's audit events and the wire contract, and
+    # nothing that decides a status: no services, no dispatch, no database, no MQTT.
+    "app/realtime": LayerRule(
+        frozenset({"redis", "pydantic", "structlog"}),
+        frozenset({"app.domain", "app.protocol", "app.realtime"}),
+    ),
+    # What drones report. It can decode events and call the dispatch service and the live
+    # view; it has no MQTT client (so it cannot publish a command) and no database layer.
     "app/telemetry": LayerRule(
         frozenset({"structlog"}),
         frozenset(
             {
                 "app.domain",
                 "app.protocol",
+                "app.realtime",
                 "app.telemetry",
                 "app.dispatch.service",
                 "app.dispatch.progress",
@@ -112,6 +121,7 @@ RULES: dict[str, LayerRule] = {
                 "app.api",
                 "app.dispatch.service",
                 "app.dispatch.exceptions",
+                "app.realtime.models",
             }
         ),
     ),
@@ -385,6 +395,57 @@ class TestTheDetectorItself:
     )
     def test_flags_the_mqtt_layer_knowing_anything_but_bytes(self, source: str) -> None:
         assert find_boundary_violations(source, RULES["app/mqtt"]) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from app.services.order_service import OrderService",  # no service: it decides nothing
+            "from app.dispatch.service import DispatchService",
+            "from app.db.session import create_engine",  # no database
+            "from app.mqtt.client import MqttClient",  # no MQTT
+            "import aiomqtt",
+            "from app.telemetry.recorder import TelemetryRecorder",
+            "import sqlalchemy",
+            "from fastapi import FastAPI",
+        ],
+    )
+    def test_flags_the_live_view_reaching_for_anything_that_decides(self, source: str) -> None:
+        assert find_boundary_violations(source, RULES["app/realtime"]) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "import redis.asyncio as aioredis",
+            "from app.domain.models import AuditEvent",
+            "from app.protocol.messages import Telemetry",
+            "from pydantic import BaseModel",
+        ],
+    )
+    def test_allows_the_live_view_its_own_dependencies(self, source: str) -> None:
+        assert find_boundary_violations(source, RULES["app/realtime"]) == []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "import redis.asyncio",  # only the live view talks to Redis
+            "from app.realtime.redis_backend import RedisRealtime",
+            "from app.realtime.memory import InMemoryRealtime",
+            "from app.realtime.channels import FLEET",
+        ],
+    )
+    def test_flags_the_api_and_telemetry_reaching_into_the_redis_backend(self, source: str) -> None:
+        assert find_boundary_violations(source, RULES["app/api"]) != []
+
+    def test_allows_the_api_the_alert_models_only(self) -> None:
+        assert (
+            find_boundary_violations("from app.realtime.models import Alert", RULES["app/api"])
+            == []
+        )
+
+    @pytest.mark.parametrize("source", ["import redis", "from redis.asyncio import Redis"])
+    def test_flags_redis_anywhere_but_the_live_view(self, source: str) -> None:
+        for layer in ("app/telemetry", "app/dispatch", "app/services", "app/simulator", "app/mqtt"):
+            assert find_boundary_violations(source, RULES[layer]) != [], layer
 
     def test_allows_dispatch_to_use_the_domain_compliance_and_service_ports(self) -> None:
         source = (

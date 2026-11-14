@@ -62,6 +62,7 @@ READ_OPERATIONS = {
     ("GET", "/internal/drones"),
     ("GET", "/internal/drones/{drone_id}"),
     ("GET", "/internal/flights/{flight_id}"),
+    ("GET", "/internal/alerts"),
 }
 
 EXPECTED_OPERATIONS = READ_OPERATIONS | set(WRITE_OPERATIONS)

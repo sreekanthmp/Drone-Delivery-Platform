@@ -46,6 +46,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--hold-seconds", type=float, default=5.0, help="simulated seconds at stops"
     )
     parser.add_argument("--tick-seconds", type=float, default=0.1)
+    parser.add_argument("--telemetry-seconds", type=float, default=1.0, help="between samples")
+    parser.add_argument(
+        "--battery-drain", type=float, default=0.01, help="percent per simulated second airborne"
+    )
     return parser.parse_args(argv)
 
 
@@ -63,7 +67,9 @@ async def serve(args: argparse.Namespace) -> None:
     client = MqttClient(
         args.mqtt_url or settings.mqtt_url, client_id=f"sim-{drones[0].drone_id.hex[:12]}"
     )
-    runner = SimulatorRunner(drones, client, tick_s=args.tick_seconds)
+    runner = SimulatorRunner(
+        drones, client, tick_s=args.tick_seconds, telemetry_interval_s=args.telemetry_seconds
+    )
     task = asyncio.create_task(runner.run())
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -77,7 +83,11 @@ async def serve(args: argparse.Namespace) -> None:
 
 def _drone(drone_id: UUID, home: Location, args: argparse.Namespace) -> SimulatedDrone:
     return SimulatedDrone(
-        drone_id, home=home, speed_factor=args.speed_factor, hold_s=args.hold_seconds
+        drone_id,
+        home=home,
+        speed_factor=args.speed_factor,
+        hold_s=args.hold_seconds,
+        battery_drain_per_s=args.battery_drain,
     )
 
 

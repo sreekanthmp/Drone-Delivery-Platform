@@ -5,7 +5,7 @@
 #
 # The API sends drone commands over MQTT (DRONE_LINK=mqtt), so a dispatch only succeeds
 # while something plays the drones: start the simulator profile, or real drones.
-# Redis arrives with live tracking (Phase 5B).
+# Redis holds the live view (latest drone state, alerts): optional and never authoritative.
 services:
   postgres:
     image: postgis/postgis:16-3.4
@@ -19,6 +19,18 @@ services:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U drone -d drone"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # No persistence: the live view is rebuilt from the drones' next samples.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -43,11 +55,14 @@ services:
         condition: service_healthy
       mosquitto:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       # Inside the compose network the hosts are the service names, not localhost.
       DATABASE_URL: postgresql+asyncpg://drone:drone@postgres:5432/drone
       DRONE_LINK: mqtt
       MQTT_URL: mqtt://mosquitto:1883
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
     # Apply migrations, then serve. In production run migrations as a separate release step.
@@ -66,7 +81,8 @@ services:
       retries: 5
       start_period: 10s
 
-  # Records what drones report (order progress, flight completion, docking). Run exactly one.
+  # Records what drones report (order progress, flight completion, docking, telemetry), runs
+  # the watchdog and the reaper. Run exactly one.
   worker:
     build: .
     depends_on:
@@ -74,9 +90,12 @@ services:
         condition: service_healthy
       mosquitto:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql+asyncpg://drone:drone@postgres:5432/drone
       MQTT_URL: mqtt://mosquitto:1883
+      REDIS_URL: redis://redis:6379/0
     command: ["python", "-m", "app.worker"]
 
   # Plays the drones: registers sim-1..sim-3 with the API and flies the missions it is sent.

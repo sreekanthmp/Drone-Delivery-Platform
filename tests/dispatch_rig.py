@@ -31,7 +31,7 @@ from app.domain.models import (
 )
 from app.domain.order_state_machine import OrderStateMachine
 from app.services.order_service import OrderService
-from app.services.ports import UnitOfWorkFactory
+from app.services.ports import AuditNotifier, UnitOfWorkFactory
 from tests.conftest import DROPOFF, HOME, PICKUP
 
 Clock = Callable[[], datetime]
@@ -170,14 +170,17 @@ def build_rig(
     *,
     clock: Clock = real_clock,
     validity: timedelta = timedelta(hours=1),
+    notifier: AuditNotifier | None = None,
 ) -> Rig:
     # A typical sortie is estimated at ~22 minutes, so the mock's permissions must outlast
     # that (the composition root does the same from settings).
-    orders = HookedOrderService(uow_factory, machine=OrderStateMachine(clock=clock))
+    orders = HookedOrderService(
+        uow_factory, machine=OrderStateMachine(clock=clock), notifier=notifier
+    )
     compliance = ScriptedCompliance(clock=clock, validity=validity)
     link = HookedLink(clock=clock)
     dispatch = DispatchService(
-        uow_factory, orders=orders, compliance=compliance, link=link, clock=clock
+        uow_factory, orders=orders, compliance=compliance, link=link, clock=clock, notifier=notifier
     )
     return Rig(uow_factory, clock, orders, compliance, link, dispatch)
 

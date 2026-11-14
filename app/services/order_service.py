@@ -24,7 +24,7 @@ from app.domain.models import (
 )
 from app.domain.order_state_machine import OrderStateMachine
 from app.services.exceptions import OrderNotFoundError
-from app.services.ports import UnitOfWorkFactory
+from app.services.ports import AuditNotifier, UnitOfWorkFactory
 
 logger = structlog.get_logger(__name__)
 
@@ -41,9 +41,20 @@ class OrderService:
         self,
         uow_factory: UnitOfWorkFactory,
         machine: OrderStateMachine | None = None,
+        notifier: AuditNotifier | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._machine = machine or OrderStateMachine()
+        self._notifier = notifier
+
+    async def _notify(self, event: AuditEvent) -> None:
+        """Tell the live view about a change that is already committed (best-effort)."""
+        if self._notifier is None:
+            return
+        try:
+            await self._notifier.notify([event])
+        except Exception:
+            logger.exception("notify_failed", event_id=str(event.event_id))
 
     async def create_order(
         self,
@@ -94,6 +105,7 @@ class OrderService:
             client_id=client_id,
             source=source.value,
         )
+        await self._notify(result.audit_event)
         return CreateOrderResult(order=result.order, created=True)
 
     async def transition(
@@ -133,6 +145,7 @@ class OrderService:
             new_state=target.value,
             source=source.value,
         )
+        await self._notify(result.audit_event)
         return result.order
 
     async def get_order(self, order_id: UUID) -> Order:

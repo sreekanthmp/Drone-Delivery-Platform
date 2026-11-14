@@ -8,7 +8,8 @@ audit event (Rules 4 and 5).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from datetime import datetime
 from types import TracebackType
 from typing import Protocol, Self
 from uuid import UUID
@@ -77,6 +78,10 @@ class DroneStore(Protocol):
         """
         ...
 
+    async def set_battery(self, drone_id: UUID, battery_percent: float, *, now: datetime) -> bool:
+        """Store a new battery level. ``False`` if there is no such drone."""
+        ...
+
 
 class FlightStore(Protocol):
     """Flights. Like orders, the only writes take a ``FlightTransitionResult``."""
@@ -89,6 +94,15 @@ class FlightStore(Protocol):
 
     async def get_live_for_drone(self, drone_id: UUID) -> Flight | None:
         """The drone's live flight, if it has one (there is at most one)."""
+        ...
+
+    async def list_live(self) -> list[Flight]:
+        """Every flight that is not finished yet, oldest first."""
+        ...
+
+    async def list_stale_preflight(self, updated_before: datetime) -> list[Flight]:
+        """Flights still in ``planned``, ``permission_granted`` or ``mission_uploaded`` whose last
+        change is older than ``updated_before``, oldest first."""
         ...
 
     async def insert(self, result: FlightTransitionResult) -> bool:
@@ -135,6 +149,16 @@ class UnitOfWork(Protocol):
     ) -> None: ...
 
     async def commit(self) -> None: ...
+
+
+class AuditNotifier(Protocol):
+    """Told about audit events *after* they have been committed (a live view of the trail).
+
+    Best-effort: implementations must not raise, and a service calls this only once the
+    change is durable, so a failure here can never undo or block a status change.
+    """
+
+    async def notify(self, events: Sequence[AuditEvent]) -> None: ...
 
 
 UnitOfWorkFactory = Callable[[], UnitOfWork]

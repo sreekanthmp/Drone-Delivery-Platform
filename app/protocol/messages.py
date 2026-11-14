@@ -165,6 +165,36 @@ class DroneEvent(_Message):
     detail: dict[str, Any] = Field(default_factory=dict)
 
 
+# --- telemetry samples: drone -> cloud ---------------------------------------------------------
+
+
+class DronePhase(StrEnum):
+    """What the drone itself says it is doing (it may disagree with the platform's records)."""
+
+    IDLE = "idle"
+    READY = "ready"
+    FLYING = "flying"
+    PAUSED = "paused"
+    RETURNING = "returning"
+    LANDED = "landed"
+
+
+class Telemetry(_Message):
+    """One sample of where the drone is and how it is. Also serves as its heartbeat.
+
+    Inbound only and best-effort (QoS 0): a lost sample costs a moment of live tracking and
+    nothing else. ``flight_id`` is the flight the drone believes it is on, if any.
+    """
+
+    sent_at: AwareDatetime
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    altitude_m: float = Field(ge=0, le=20_000)
+    battery_percent: float = Field(ge=0, le=100)
+    phase: DronePhase
+    flight_id: UUID | None = None
+
+
 # --- encoding ----------------------------------------------------------------------------------
 
 
@@ -184,6 +214,13 @@ def decode_ack(payload: bytes) -> AckMessage:
         return AckMessage.model_validate_json(payload)
     except ValidationError as error:
         raise ProtocolError(f"not a valid acknowledgement: {_summarise(error)}") from error
+
+
+def decode_telemetry(payload: bytes) -> Telemetry:
+    try:
+        return Telemetry.model_validate_json(payload)
+    except ValidationError as error:
+        raise ProtocolError(f"not a valid telemetry sample: {_summarise(error)}") from error
 
 
 def decode_event(payload: bytes) -> DroneEvent:

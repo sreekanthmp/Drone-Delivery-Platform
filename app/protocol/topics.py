@@ -1,12 +1,13 @@
 """MQTT topic names. Every topic is built here, so a typo cannot create a new channel.
 
-=====================================  ==========  ========================================
-Topic                                  Direction   Carries
-=====================================  ==========  ========================================
+=====================================  ============  ======================================
+Topic                                  Direction     Carries
+=====================================  ============  ======================================
 ``drones/{drone_id}/commands``         cloud->drone  one of the five high-level commands
 ``platform/acks/{instance_id}``        drone->cloud  the drone's answer to a command
-``drones/{drone_id}/events``           drone->cloud  mission progress events
-=====================================  ==========  ========================================
+``drones/{drone_id}/events``           drone->cloud  mission progress events (QoS 1)
+``drones/{drone_id}/telemetry``        drone->cloud  position/battery samples (QoS 0)
+=====================================  ============  ======================================
 
 Acks go to a per-process topic named in the command (``reply_to``), so any number of API
 processes can send commands without receiving each other's answers.
@@ -21,9 +22,13 @@ from uuid import UUID
 EVENTS_FILTER: Final = "drones/+/events"
 """Subscribe to this to receive the events of every drone."""
 
+TELEMETRY_FILTER: Final = "drones/+/telemetry"
+"""Subscribe to this to receive the telemetry samples of every drone."""
+
 _INSTANCE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _EVENT_TOPIC = re.compile(r"drones/(?P<drone_id>[0-9a-fA-F-]{36})/events")
 _COMMAND_TOPIC = re.compile(r"drones/(?P<drone_id>[0-9a-fA-F-]{36})/commands")
+_TELEMETRY_TOPIC = re.compile(r"drones/(?P<drone_id>[0-9a-fA-F-]{36})/telemetry")
 
 
 def command_topic(drone_id: UUID) -> str:
@@ -32,6 +37,10 @@ def command_topic(drone_id: UUID) -> str:
 
 def event_topic(drone_id: UUID) -> str:
     return f"drones/{drone_id}/events"
+
+
+def telemetry_topic(drone_id: UUID) -> str:
+    return f"drones/{drone_id}/telemetry"
 
 
 def ack_topic(instance_id: str) -> str:
@@ -60,6 +69,17 @@ def parse_event_topic(topic: str) -> UUID | None:
 def parse_command_topic(topic: str) -> UUID | None:
     """The drone a command topic belongs to (used by whoever plays the drone)."""
     match = _COMMAND_TOPIC.fullmatch(topic)
+    if match is None:
+        return None
+    try:
+        return UUID(match["drone_id"])
+    except ValueError:
+        return None
+
+
+def parse_telemetry_topic(topic: str) -> UUID | None:
+    """The drone a telemetry topic belongs to, or ``None`` if it is not a valid one."""
+    match = _TELEMETRY_TOPIC.fullmatch(topic)
     if match is None:
         return None
     try:

@@ -98,6 +98,10 @@ class Drone:
             raise InvalidDroneTransitionError(self.status, target)
         return replace(self, status=target, updated_at=now)
 
+    def with_battery(self, battery_percent: float, *, now: datetime) -> Self:
+        """A copy with a new battery level (validated like at registration)."""
+        return replace(self, battery_percent=battery_percent, updated_at=now)
+
     @classmethod
     def rehydrate(
         cls,

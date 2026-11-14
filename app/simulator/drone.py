@@ -35,6 +35,10 @@ class Phase(StrEnum):
     """Grounded where it stood (a land command): it stays there until recovered."""
 
 
+_AIRBORNE = {Phase.FLYING, Phase.PAUSED, Phase.RETURNING}
+_CRUISE_ALTITUDE_M = 60.0
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -56,16 +60,23 @@ class SimulatedDrone:
         speed_factor: float = 1.0,
         hold_s: float = 5.0,
         approach_radius_m: float = 300.0,
+        battery_percent: float = 100.0,
+        battery_drain_per_s: float = 0.01,
         clock: Callable[[], datetime] = _utc_now,
         id_factory: Callable[[], UUID] = uuid4,
     ) -> None:
         if speed_factor <= 0:
             raise ValueError("speed_factor must be positive")
+        if not 0 <= battery_percent <= 100 or battery_drain_per_s < 0:
+            raise ValueError("battery must be within 0..100 and drain must not be negative")
         self.drone_id = drone_id
         self.home = home
         self.speed_factor = speed_factor
         self.hold_s = hold_s
         self.approach_radius_m = approach_radius_m
+        self.full_battery = battery_percent
+        self.battery_percent = battery_percent
+        self._drain_per_s = battery_drain_per_s
         self._clock = clock
         self._ids = id_factory
 
@@ -194,6 +205,8 @@ class SimulatedDrone:
         """Let ``real_seconds`` pass (scaled by ``speed_factor``); return what was reported."""
         self._events = []
         budget = real_seconds * self.speed_factor
+        if self.phase in _AIRBORNE:  # hovering costs as much as flying, as on a real drone
+            self.battery_percent = max(0.0, self.battery_percent - budget * self._drain_per_s)
         while budget > 1e-9 and self.phase in {Phase.FLYING, Phase.RETURNING}:
             if self._hold_left > 0:
                 used = min(self._hold_left, budget)
@@ -212,8 +225,29 @@ class SimulatedDrone:
         if self.phase is Phase.LANDED:
             self.position = self.home
             self.phase = Phase.IDLE
+            self.battery_percent = self.full_battery
             self._emit(wire.EventType.DOCKED)
         return self._events
+
+    def sample(self) -> wire.Telemetry:
+        """What the drone would report about itself right now (also its heartbeat)."""
+        airborne = self.phase in _AIRBORNE
+        altitude = 0.0
+        if airborne:
+            altitude = (
+                self.mission.waypoints[self._wp].altitude_m
+                if self.mission is not None and self.phase is not Phase.RETURNING
+                else _CRUISE_ALTITUDE_M
+            )
+        return wire.Telemetry(
+            sent_at=self._clock(),
+            latitude=self.position.latitude,
+            longitude=self.position.longitude,
+            altitude_m=altitude,
+            battery_percent=round(self.battery_percent, 2),
+            phase=wire.DronePhase(self.phase.value),
+            flight_id=self.flight_id if self.phase not in {Phase.IDLE, Phase.READY} else None,
+        )
 
     def fault(self, code: str, message: str = "") -> list[wire.DroneEvent]:
         """Report a fault (it changes nothing about how the drone flies)."""
@@ -248,6 +282,7 @@ class SimulatedDrone:
         assert self.mission is not None
         if self.phase is Phase.RETURNING:
             self.phase = Phase.IDLE
+            self.battery_percent = self.full_battery  # back on the dock: a fresh battery
             self._emit(wire.EventType.DOCKED)
             return
         kind = self.mission.waypoints[self._wp].kind
@@ -260,6 +295,7 @@ class SimulatedDrone:
         elif kind is WaypointKind.LAND:
             self._emit(wire.EventType.MISSION_COMPLETED)
             self.phase = Phase.IDLE
+            self.battery_percent = self.full_battery
             self.mission = None
         else:
             self._wp += 1

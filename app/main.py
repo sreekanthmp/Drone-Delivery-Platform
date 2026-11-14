@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.adapters.registry import AdapterRegistry, default_registry
 from app.api import health
 from app.api.errors import register_error_handlers
+from app.api.internal import alerts as internal_alerts
 from app.api.internal import drones as internal_drones
 from app.api.internal import flights as internal_flights
 from app.api.internal import orders as internal_orders
@@ -40,6 +41,10 @@ from app.dispatch.mqtt_link import MqttDroneLink
 from app.dispatch.service import DispatchService
 from app.logging import configure_logging
 from app.mqtt.client import MqttClient
+from app.realtime.connection import connect
+from app.realtime.notifier import AuditBroadcaster
+from app.realtime.ports import LiveView
+from app.realtime.redis_backend import RedisRealtime
 from app.services.order_service import OrderService
 from app.services.ports import UnitOfWorkFactory
 
@@ -69,6 +74,7 @@ def create_app(
     compliance: ComplianceProvider | None = None,
     drone_link: DroneLink | None = None,
     mqtt_client: MqttClient | None = None,
+    realtime: LiveView | None = None,
 ) -> FastAPI:
     """Build the application.
 
@@ -80,6 +86,10 @@ def create_app(
     link follows ``settings.drone_link``: the in-memory stand-in, or MQTT, in which case the
     app runs an MQTT client for the acknowledgements and reports not-ready while it is not
     connected. Tests pass their own ``compliance``, ``drone_link`` or ``mqtt_client``.
+
+    ``realtime`` is the live view (Redis, from ``settings.redis_url``, or a test stand-in):
+    optional, a view and never the source of truth. Without it everything still works; with
+    it, committed changes are announced to watchers and ``GET /internal/alerts`` has content.
     """
     settings = settings or get_settings()
     compliance = compliance or MockDigitalSky(
@@ -112,13 +122,22 @@ def create_app(
 
         return combined
 
+    redis_client = None
+    if realtime is None and settings.redis_url:
+        redis_client = connect(settings.redis_url)
+        realtime = RedisRealtime(
+            redis_client, state_ttl=timedelta(seconds=settings.live_state_ttl_seconds)
+        )
+    notifier = AuditBroadcaster(realtime) if realtime is not None else None
+
     def wire(app: FastAPI, factory: UnitOfWorkFactory) -> None:
-        orders = OrderService(factory)
+        orders = OrderService(factory, notifier=notifier)
         app.state.order_service = orders
         app.state.compliance = compliance
         app.state.drone_link = drone_link
+        app.state.realtime = realtime
         app.state.dispatch_service = DispatchService(
-            factory, orders=orders, compliance=compliance, link=drone_link
+            factory, orders=orders, compliance=compliance, link=drone_link, notifier=notifier
         )
 
     @asynccontextmanager
@@ -143,6 +162,8 @@ def create_app(
                 mqtt_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await mqtt_task
+            if redis_client is not None:
+                await redis_client.aclose()
             if engine is not None:
                 await engine.dispose()
             logger.info("app_stopped")
@@ -159,4 +180,5 @@ def create_app(
     app.include_router(internal_orders.router)
     app.include_router(internal_drones.router)
     app.include_router(internal_flights.router)
+    app.include_router(internal_alerts.router)
     return app

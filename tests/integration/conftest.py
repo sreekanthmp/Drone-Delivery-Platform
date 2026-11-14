@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -249,3 +249,57 @@ def mosquitto_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     finally:
         process.terminate()
         process.wait(timeout=10)
+
+
+# --- Redis: a real redis-server --------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def redis_url() -> Iterator[str]:
+    """A throwaway Redis on a free port (no persistence, localhost only).
+
+    Skipped with the reason when the binary is missing, unless ``REQUIRE_INTEGRATION=1``.
+    """
+    import shutil
+    import socket
+    import subprocess
+    import time
+
+    binary = shutil.which("redis-server")
+    if binary is None:
+        _unavailable("the redis-server binary is not installed")
+        return
+    port = _free_port()
+    process = subprocess.Popen(
+        [binary, "--port", str(port), "--bind", "127.0.0.1", "--save", "", "--appendonly", "no"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+                break
+            except OSError:
+                if process.poll() is not None or time.monotonic() > deadline:
+                    _unavailable("the redis server did not start")
+                    return
+                time.sleep(0.05)
+        yield f"redis://127.0.0.1:{port}/0"
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+
+
+@pytest.fixture
+async def redis_client(redis_url: str) -> AsyncIterator[Any]:
+    """A client on a clean Redis database."""
+    import redis.asyncio as aioredis
+
+    client = aioredis.Redis.from_url(redis_url, decode_responses=True)
+    await client.flushdb()
+    try:
+        yield client
+    finally:
+        await client.aclose()

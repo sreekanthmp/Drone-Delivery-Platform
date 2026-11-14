@@ -8,16 +8,12 @@ protocol, the durable session and the event handling are proven to work together
 from __future__ import annotations
 
 import asyncio
-import contextlib
-from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator
 from datetime import timedelta
-from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from fastapi import FastAPI
 
 from app.config import Settings
 from app.main import create_app
@@ -25,102 +21,22 @@ from app.mqtt.client import MqttClient
 from app.protocol import messages as wire
 from app.protocol import topics
 from app.services.ports import UnitOfWorkFactory
-from app.simulator.drone import Phase, SimulatedDrone
-from app.simulator.runner import SimulatorRunner
-from app.worker import Worker
-from tests.api.conftest import place_order, register_drone
-from tests.conftest import HOME, T0
+from app.simulator.drone import Phase
+from tests.api.conftest import place_order
+from tests.conftest import T0
 from tests.integration.conftest import RunSql
+from tests.integration.stack import (
+    Stack,
+    audit,
+    counted,
+    eventually,
+    have,
+    is_,
+    order_is,
+    picked_up_event,
+)
 
 pytestmark = pytest.mark.integration
-
-
-async def eventually(check: Callable[[], Awaitable[bool]], *, timeout: float = 15.0) -> None:
-    """Poll until ``check`` is true, failing with a clear message if it never is."""
-    try:
-        async with asyncio.timeout(timeout):
-            while not await check():
-                await asyncio.sleep(0.05)
-    except TimeoutError:
-        raise AssertionError(f"the condition did not become true within {timeout}s") from None
-
-
-@dataclass
-class Stack:
-    http: httpx.AsyncClient
-    app: FastAPI
-    mqtt_url: str
-    uow_factory: UnitOfWorkFactory
-    sims: dict[UUID, SimulatedDrone] = field(default_factory=dict)
-    worker: Worker | None = None
-    worker_id: str = field(default_factory=lambda: f"worker-{uuid4().hex[:10]}")
-    _tasks: list[asyncio.Task[None]] = field(default_factory=list)
-    _worker_task: asyncio.Task[None] | None = None
-
-    async def add_drone(
-        self, *, speed_factor: float = 3000.0, hold_s: float = 1.0, play: bool = True
-    ) -> SimulatedDrone:
-        """Register a drone with the platform and (by default) start simulating it."""
-        registered = await register_drone(self.http, name=f"drone-{uuid4().hex[:8]}")
-        drone = SimulatedDrone(
-            UUID(registered["id"]), home=HOME, speed_factor=speed_factor, hold_s=hold_s
-        )
-        self.sims[drone.drone_id] = drone
-        if play:
-            client = MqttClient(self.mqtt_url, client_id=f"sim-{drone.drone_id.hex[:12]}")
-            runner = SimulatorRunner([drone], client, tick_s=0.02)
-            self._tasks.append(asyncio.create_task(runner.run()))
-            await client.wait_connected(5)
-        return drone
-
-    async def start_worker(self) -> Worker:
-        client = MqttClient(self.mqtt_url, client_id=self.worker_id, durable=True)
-        self.worker = Worker(self.uow_factory, client)
-        self._worker_task = asyncio.create_task(self.worker.run())
-        await client.wait_connected(5)
-        return self.worker
-
-    async def stop_worker(self) -> None:
-        assert self._worker_task is not None
-        self._worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._worker_task
-        self._worker_task = None
-
-    async def publish_raw(self, topic: str, payload: bytes) -> None:
-        client = MqttClient(self.mqtt_url, client_id=f"raw-{uuid4().hex[:8]}")
-        task = asyncio.create_task(client.run({}))
-        try:
-            await client.wait_connected(5)
-            await client.publish(topic, payload, qos=1)
-        finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-
-    async def close(self) -> None:
-        for task in self._tasks:
-            task.cancel()
-        for task in self._tasks:
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        if self._worker_task is not None:
-            await self.stop_worker()
-
-    # --- observing ---------------------------------------------------------------------------
-
-    async def order(self, order_id: UUID) -> dict[str, Any]:
-        body: dict[str, Any] = (await self.http.get(f"/internal/orders/{order_id}")).json()
-        return body
-
-    async def flights(self, order_id: UUID) -> list[dict[str, Any]]:
-        body: list[dict[str, Any]] = (
-            await self.http.get(f"/internal/orders/{order_id}/flights")
-        ).json()
-        return body
-
-    async def drone_status(self, drone_id: UUID) -> str:
-        return str((await self.http.get(f"/internal/drones/{drone_id}")).json()["status"])
 
 
 @pytest.fixture
@@ -150,26 +66,6 @@ async def stack(
                 await built.close()
 
 
-async def audit(run_sql: RunSql, order_id: UUID) -> list[tuple[str, str, str]]:
-    rows = await run_sql(
-        "SELECT event_type, new_state, source FROM audit_events WHERE order_id = :o ORDER BY seq",
-        o=order_id,
-    )
-    return [(r[0], r[1], r[2]) for r in rows]
-
-
-def picked_up_event(flight_id: str, seq: int, type_: str = "package_picked_up") -> bytes:
-    return wire.encode(
-        wire.DroneEvent(
-            event_id=uuid4(),
-            flight_id=UUID(flight_id),
-            seq=seq,
-            type=wire.EventType(type_),
-            occurred_at=T0,
-        )
-    )
-
-
 class TestADeliveryOverRealMqtt:
     async def test_dispatch_to_delivered_with_no_human_in_the_loop(
         self, stack: Stack, run_sql: RunSql
@@ -189,7 +85,7 @@ class TestADeliveryOverRealMqtt:
             return [f["status"] for f in await stack.flights(order_id)] == ["completed"]
 
         await eventually(completed)
-        await eventually(lambda: _is(stack.drone_status(drone.drone_id), "available"))
+        await eventually(lambda: is_(stack.drone_status(drone.drone_id), "available"))
         assert drone.phase is Phase.IDLE
 
         trail = await audit(run_sql, order_id)
@@ -213,8 +109,8 @@ class TestADeliveryOverRealMqtt:
         drone = await stack.add_drone()
         first = await place_order(stack.http)
         await stack.http.post(f"/internal/orders/{first}/dispatch")
-        await eventually(lambda: _is(stack.drone_status(drone.drone_id), "available"))
-        await eventually(lambda: _order_is(stack, first, "delivered"))
+        await eventually(lambda: is_(stack.drone_status(drone.drone_id), "available"))
+        await eventually(lambda: order_is(stack, first, "delivered"))
 
         second_response = await stack.http.post(
             "/partner/mock/orders",
@@ -229,7 +125,7 @@ class TestADeliveryOverRealMqtt:
         dispatched = (await stack.http.post(f"/internal/orders/{second}/dispatch")).json()
 
         assert dispatched["outcome"] == "started"
-        await eventually(lambda: _order_is(stack, second, "delivered"))
+        await eventually(lambda: order_is(stack, second, "delivered"))
 
     async def test_pause_and_resume_work_over_the_wire(self, stack: Stack) -> None:
         drone = await stack.add_drone(speed_factor=1.0)  # slow: it is still in the air
@@ -260,7 +156,7 @@ class TestFailuresOverRealMqtt:
         assert cancelled.status_code == 200
         assert (await stack.order(order_id))["status"] == "cancelled"
         assert [f["status"] for f in await stack.flights(order_id)] == ["aborted"]
-        await eventually(lambda: _is(stack.drone_status(drone.drone_id), "available"))
+        await eventually(lambda: is_(stack.drone_status(drone.drone_id), "available"))
         assert drone.phase is Phase.IDLE
         assert (await stack.order(order_id))["status"] == "cancelled"  # nothing resurrected it
 
@@ -275,7 +171,7 @@ class TestFailuresOverRealMqtt:
         assert body["order"]["status"] == "failed"
         assert body["flight"]["status"] == "aborted"
         # the platform could not know it had started, so it recalled it (which the drone obeyed)
-        await eventually(lambda: _is(stack.drone_status(drone.drone_id), "available"))
+        await eventually(lambda: is_(stack.drone_status(drone.drone_id), "available"))
         assert drone.phase is Phase.IDLE
 
     async def test_a_drone_that_refuses_the_mission_fails_the_upload(self, stack: Stack) -> None:
@@ -318,7 +214,7 @@ class TestDuplicatesAndOutOfOrderEvents:
         await stack.publish_raw(topic, picked_up_event(flight_id, 2, "departed_pickup"))
         await stack.publish_raw(topic, picked_up_event(flight_id, 2, "departed_pickup"))
 
-        await eventually(lambda: _order_is(stack, order_id, "in_flight"))
+        await eventually(lambda: order_is(stack, order_id, "in_flight"))
         await asyncio.sleep(0.3)  # let any stragglers arrive
         trail = await audit(run_sql, order_id)
         telemetry = [state for _, state, source in trail if source == "telemetry"]
@@ -341,7 +237,7 @@ class TestDuplicatesAndOutOfOrderEvents:
         )
 
         assert stack.worker is not None
-        await eventually(lambda: _counted(stack, "rejected", 1))
+        await eventually(lambda: counted(stack, "rejected", 1))
         assert (await stack.order(order_id))["status"] == "assigned"
         assert [s for _, s, src in await audit(run_sql, order_id) if src == "telemetry"] == []
 
@@ -352,14 +248,14 @@ class TestDuplicatesAndOutOfOrderEvents:
         await stack.publish_raw(topic, b"not json at all")
         await stack.publish_raw(topic, b'{"type": "teleported"}')
 
-        await eventually(lambda: _counted(stack, "invalid", 2))
+        await eventually(lambda: counted(stack, "invalid", 2))
         # and the worker is still alive and useful
         order_id = await place_order(stack.http)
         flight_id = (await stack.http.post(f"/internal/orders/{order_id}/dispatch")).json()[
             "flight"
         ]["id"]
         await stack.publish_raw(topic, picked_up_event(flight_id, 1))
-        await eventually(lambda: _order_is(stack, order_id, "picked_up"))
+        await eventually(lambda: order_is(stack, order_id, "picked_up"))
 
 
 class TestTheDurableSession:
@@ -380,7 +276,7 @@ class TestTheDurableSession:
 
         await stack.start_worker()  # ...and comes back with the same identity
 
-        await eventually(lambda: _order_is(stack, order_id, "in_flight"))
+        await eventually(lambda: order_is(stack, order_id, "in_flight"))
 
 
 class TestRule2OnTheWire:
@@ -419,7 +315,7 @@ class TestRule2OnTheWire:
         )
 
         await stack.publish_raw(topics.command_topic(drone.drone_id), wire.encode(expired))
-        await eventually(lambda: _have(acks))
+        await eventually(lambda: have(acks))
         task.cancel()
 
         assert acks[0].status is wire.AckStatus.REJECTED
@@ -431,23 +327,3 @@ class TestRule2OnTheWire:
 class TestReadiness:
     async def test_the_app_is_ready_once_it_is_connected_to_the_broker(self, stack: Stack) -> None:
         assert (await stack.http.get("/ready")).status_code == 200
-
-
-# --- small async predicates used with ``eventually`` ------------------------------------------
-
-
-async def _is(awaitable: Awaitable[str], expected: str) -> bool:
-    return (await awaitable) == expected
-
-
-async def _order_is(stack: Stack, order_id: UUID, expected: str) -> bool:
-    return (await stack.order(order_id))["status"] == expected
-
-
-async def _counted(stack: Stack, outcome: str, at_least: int) -> bool:
-    assert stack.worker is not None
-    return stack.worker.ingest.counts[outcome] >= at_least  # type: ignore[index]
-
-
-async def _have(items: list[Any]) -> bool:
-    return bool(items)

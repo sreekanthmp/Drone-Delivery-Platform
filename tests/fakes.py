@@ -10,6 +10,7 @@ same assertions against both implementations to keep the fake honest.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from types import TracebackType
 from typing import Self
 from uuid import UUID
@@ -21,6 +22,7 @@ from app.domain.models import (
     Drone,
     DroneStatus,
     Flight,
+    FlightStatus,
     Order,
 )
 from app.domain.models.drone import check_status_change
@@ -108,6 +110,13 @@ class _DroneStore:
         drones = [d for d in self._drones.values() if d.status is DroneStatus.AVAILABLE]
         return sorted(drones, key=lambda d: d.id)
 
+    async def set_battery(self, drone_id: UUID, battery_percent: float, *, now: datetime) -> bool:
+        drone = self._drones.get(drone_id)
+        if drone is None:
+            return False
+        self._drones[drone_id] = drone.with_battery(battery_percent, now=now)
+        return True
+
     async def apply_status_change(self, before: Drone, after: Drone) -> None:
         check_status_change(before, after)
         current = self._drones.get(before.id)
@@ -133,6 +142,23 @@ class _FlightStore:
             (f for f in self._flights.values() if f.drone_id == drone_id and f.status.is_live),
             None,
         )
+
+    async def list_live(self) -> list[Flight]:
+        live = [f for f in self._flights.values() if f.status.is_live]
+        return sorted(live, key=lambda f: (f.created_at, f.id))
+
+    async def list_stale_preflight(self, updated_before: datetime) -> list[Flight]:
+        preflight = {
+            FlightStatus.PLANNED,
+            FlightStatus.PERMISSION_GRANTED,
+            FlightStatus.MISSION_UPLOADED,
+        }
+        stale = [
+            f
+            for f in self._flights.values()
+            if f.status in preflight and f.updated_at < updated_before
+        ]
+        return sorted(stale, key=lambda f: (f.updated_at, f.id))
 
     async def insert(self, result: FlightTransitionResult) -> bool:
         if result.audit_event.event_type is not AuditEventType.FLIGHT_CREATED:

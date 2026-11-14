@@ -176,3 +176,77 @@ def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
         assert get_settings() is get_settings()
     finally:
         get_settings.cache_clear()
+
+
+class TestLiveView:
+    def test_it_is_off_by_default_and_the_thresholds_are_sensible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for name in (
+            "REDIS_URL",
+            "LIVE_STATE_TTL_SECONDS",
+            "LINK_LOST_AFTER_SECONDS",
+            "LOW_BATTERY_PERCENT",
+            "STATE_MISMATCH_GRACE_SECONDS",
+            "BATTERY_SYNC_STEP_PERCENT",
+            "STALE_RESERVATION_MINUTES",
+            "WATCHDOG_INTERVAL_SECONDS",
+            "REAPER_INTERVAL_SECONDS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        settings = make()
+
+        assert settings.redis_url is None
+        assert settings.live_state_ttl_seconds == 60
+        assert settings.link_lost_after_seconds == 15.0
+        assert settings.low_battery_percent == 20.0
+        assert settings.state_mismatch_grace_seconds == 30.0
+        assert settings.battery_sync_step_percent == 5.0
+        assert settings.stale_reservation_minutes == 5
+        assert settings.watchdog_interval_seconds == 5.0
+        assert settings.reaper_interval_seconds == 60.0
+
+    def test_the_link_is_declared_lost_before_the_live_state_expires(self) -> None:
+        """Else a silent drone would simply vanish from the view instead of raising an alert."""
+        settings = make()
+
+        assert settings.link_lost_after_seconds < settings.live_state_ttl_seconds
+
+    def test_values_come_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("REDIS_URL", "redis://cache:6380/2")
+        monkeypatch.setenv("STALE_RESERVATION_MINUTES", "10")
+        monkeypatch.setenv("LOW_BATTERY_PERCENT", "30")
+
+        settings = make()
+
+        assert settings.redis_url == "redis://cache:6380/2"
+        assert settings.stale_reservation_minutes == 10
+        assert settings.low_battery_percent == 30.0
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_a_blank_url_means_no_redis(self, blank: str) -> None:
+        assert make(redis_url=blank).redis_url is None
+
+    @pytest.mark.parametrize("url", ["localhost:6379", "http://x", "tcp://x:6379", "memcached://x"])
+    def test_the_url_must_be_a_redis_url(self, url: str) -> None:
+        with pytest.raises(ValidationError, match="redis://"):
+            make(redis_url=url)
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("live_state_ttl_seconds", "0"),
+            ("link_lost_after_seconds", "0"),
+            ("low_battery_percent", "101"),
+            ("low_battery_percent", "-1"),
+            ("state_mismatch_grace_seconds", "-1"),
+            ("battery_sync_step_percent", "0"),
+            ("stale_reservation_minutes", "0"),
+            ("watchdog_interval_seconds", "0"),
+            ("reaper_interval_seconds", "0"),
+        ],
+    )
+    def test_nonsense_values_are_refused(self, name: str, value: str) -> None:
+        with pytest.raises(ValidationError):
+            make(**{name: value})

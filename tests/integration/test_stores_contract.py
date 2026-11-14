@@ -7,7 +7,7 @@ assertions on both keep the in-memory fake honest.
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
@@ -230,6 +230,47 @@ class TestDroneStore:
         async with uow_factory() as uow:
             assert await uow.drones.get(DRONE_ID, for_update=True) is not None
 
+    async def test_a_battery_level_is_stored_with_its_time(
+        self, uow_factory: UnitOfWorkFactory
+    ) -> None:
+        async with uow_factory() as uow:
+            assert await uow.drones.add(build_drone(battery_percent=90.0))
+            await uow.commit()
+        moment = datetime(2026, 11, 14, 12, 30, tzinfo=UTC)
+
+        async with uow_factory() as uow:
+            assert await uow.drones.set_battery(DRONE_ID, 42.5, now=moment) is True
+            await uow.commit()
+
+        async with uow_factory() as uow:
+            stored = await uow.drones.get(DRONE_ID)
+        assert stored is not None
+        assert stored.battery_percent == 42.5
+        assert stored.updated_at == moment
+        assert stored.status is D.AVAILABLE  # nothing else changed
+
+    async def test_a_battery_for_a_missing_drone_is_reported_not_raised(
+        self, uow_factory: UnitOfWorkFactory
+    ) -> None:
+        async with uow_factory() as uow:
+            assert await uow.drones.set_battery(UUID(int=404), 50.0, now=datetime.now(UTC)) is False
+
+    async def test_a_battery_change_not_committed_is_not_kept(
+        self, uow_factory: UnitOfWorkFactory
+    ) -> None:
+        async with uow_factory() as uow:
+            assert await uow.drones.add(build_drone(battery_percent=90.0))
+            await uow.commit()
+
+        async with uow_factory() as uow:
+            await uow.drones.set_battery(DRONE_ID, 5.0, now=datetime.now(UTC))
+            # no commit
+
+        async with uow_factory() as uow:
+            stored = await uow.drones.get(DRONE_ID)
+        assert stored is not None
+        assert stored.battery_percent == 90.0
+
 
 class TestFlightStore:
     async def test_a_planned_flight_round_trips_exactly(
@@ -325,6 +366,73 @@ class TestFlightStore:
             listed = await uow.flights.list_for_order(order.id)
 
         assert [f.id for f in listed] == [first.id, second.id, third.id]
+
+    async def test_every_unfinished_flight_is_listed_and_no_finished_one(
+        self, world: tuple[UnitOfWorkFactory, Order, Order]
+    ) -> None:
+        factory, order, other_order = world
+        flow = FlightFlow(factory)
+        await flow.flight_in(S.CANCELLED, order.id, DRONE_ID)  # finished
+        planned = await flow.plan(order.id, DRONE_ID)
+        started = await flow.flight_in(S.STARTED, other_order.id, OTHER_DRONE)
+
+        async with factory() as uow:
+            listed = await uow.flights.list_live()
+
+        assert {f.id for f in listed} == {planned.id, started.id}
+        assert [f.created_at for f in listed] == sorted(f.created_at for f in listed)
+
+    async def test_nothing_is_live_when_nothing_is_flying(
+        self, world: tuple[UnitOfWorkFactory, Order, Order]
+    ) -> None:
+        factory, _, _ = world
+
+        async with factory() as uow:
+            assert await uow.flights.list_live() == []
+
+    async def test_stale_preflight_flights_are_found_by_how_long_ago_they_last_changed(
+        self, world: tuple[UnitOfWorkFactory, Order, Order]
+    ) -> None:
+        factory, order, other_order = world
+        long_ago = datetime(2026, 1, 1, tzinfo=UTC)
+        old = await FlightFlow(factory, clock=lambda: long_ago).flight_in(
+            S.PERMISSION_GRANTED, order.id, DRONE_ID
+        )
+        await FlightFlow(factory).plan(other_order.id, OTHER_DRONE)  # just now
+        cutoff = datetime.now(UTC) - timedelta(minutes=5)
+
+        async with factory() as uow:
+            stale = await uow.flights.list_stale_preflight(cutoff)
+
+        assert [f.id for f in stale] == [old.id]
+
+    @pytest.mark.parametrize("status", [S.PLANNED, S.PERMISSION_GRANTED, S.MISSION_UPLOADED])
+    async def test_each_preflight_status_counts_as_stale_preflight(
+        self, world: tuple[UnitOfWorkFactory, Order, Order], status: FlightStatus
+    ) -> None:
+        factory, order, _ = world
+        old = await FlightFlow(factory, clock=lambda: datetime(2026, 1, 1, tzinfo=UTC)).flight_in(
+            status, order.id, DRONE_ID
+        )
+
+        async with factory() as uow:
+            stale = await uow.flights.list_stale_preflight(datetime.now(UTC))
+
+        assert [f.id for f in stale] == [old.id]
+
+    # (aborted is absent on purpose: it can only be reached through 'started', which the
+    # database refuses for a flight whose permission, stamped long ago, has expired.)
+    @pytest.mark.parametrize("status", [S.PERMISSION_DENIED, S.UPLOAD_FAILED, S.CANCELLED])
+    async def test_finished_flights_are_never_stale_preflight(
+        self, world: tuple[UnitOfWorkFactory, Order, Order], status: FlightStatus
+    ) -> None:
+        factory, order, _ = world
+        await FlightFlow(factory, clock=lambda: datetime(2026, 1, 1, tzinfo=UTC)).flight_in(
+            status, order.id, DRONE_ID
+        )
+
+        async with factory() as uow:
+            assert await uow.flights.list_stale_preflight(datetime.now(UTC)) == []
 
     async def test_the_live_flight_of_a_drone(
         self, world: tuple[UnitOfWorkFactory, Order, Order]

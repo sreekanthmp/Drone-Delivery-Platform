@@ -44,6 +44,17 @@ class FakeClient:
             if topic == topics.event_topic(DRONE_ID)
         ]
 
+    def non_telemetry(self) -> list[tuple[str, bytes, int]]:
+        """Everything published except telemetry samples (which tick on their own schedule)."""
+        return [m for m in self.published if "telemetry" not in m[0]]
+
+    def samples(self) -> list[wire.Telemetry]:
+        return [
+            wire.decode_telemetry(payload)
+            for topic, payload, _ in self.published
+            if topic == topics.telemetry_topic(DRONE_ID)
+        ]
+
     def acks(self) -> list[tuple[str, wire.AckMessage]]:
         return [
             (topic, wire.decode_ack(payload))
@@ -110,7 +121,7 @@ class TestCommands:
 
         await runner._on_command(topics.command_topic(DRONE_ID), encode(command))
 
-        assert client.published == []
+        assert client.non_telemetry() == []
 
     async def test_a_silent_drone_does_not_acknowledge(
         self, runner: SimulatorRunner, client: FakeClient, drone: SimulatedDrone
@@ -136,7 +147,7 @@ class TestCommands:
     ) -> None:
         await runner._on_command(topic, payload)
 
-        assert client.published == []
+        assert client.non_telemetry() == []
 
 
 class TestEvents:
@@ -178,3 +189,65 @@ class TestEvents:
         runner.report(drone, drone.fault("GPS_LOSS"))
 
         await until(lambda: any(e.type is wire.EventType.FAULT for e in client.events()))
+
+
+class TestTelemetry:
+    @pytest.fixture
+    async def sampling(
+        self, client: FakeClient, drone: SimulatedDrone
+    ) -> AsyncIterator[SimulatorRunner]:
+        runner = SimulatorRunner([drone], client, tick_s=0.01, telemetry_interval_s=0.03)  # type: ignore[arg-type]
+        task = asyncio.create_task(runner.run())
+        await until(lambda: bool(client.subscriptions))
+        yield runner
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def test_samples_are_published_regularly_at_qos_0_even_when_idle(
+        self, sampling: SimulatorRunner, client: FakeClient
+    ) -> None:
+        await until(lambda: len(client.samples()) >= 4)
+
+        assert {s.phase for s in client.samples()} == {wire.DronePhase.IDLE}
+        sample_publishes = [
+            (topic, qos) for topic, _, qos in client.published if "telemetry" in topic
+        ]
+        assert {qos for _, qos in sample_publishes} == {0}
+        assert {topic for topic, _ in sample_publishes} == {topics.telemetry_topic(DRONE_ID)}
+
+    async def test_samples_follow_the_flight(
+        self, sampling: SimulatorRunner, client: FakeClient, clock: FakeClock
+    ) -> None:
+        await sampling._on_command(topics.command_topic(DRONE_ID), encode(upload()))
+        await sampling._on_command(topics.command_topic(DRONE_ID), encode(start(clock)))
+
+        await until(lambda: any(s.phase is wire.DronePhase.FLYING for s in client.samples()))
+
+        flying = next(s for s in client.samples() if s.phase is wire.DronePhase.FLYING)
+        assert flying.flight_id is not None
+        assert flying.altitude_m > 0
+
+    async def test_a_muted_drone_goes_silent_but_still_flies_and_reports_events(
+        self, sampling: SimulatorRunner, client: FakeClient, clock: FakeClock, drone: SimulatedDrone
+    ) -> None:
+        await until(lambda: len(client.samples()) >= 2)
+        sampling.muted.add(DRONE_ID)
+        await asyncio.sleep(0.05)
+        seen = len(client.samples())
+
+        await sampling._on_command(topics.command_topic(DRONE_ID), encode(upload()))
+        await sampling._on_command(topics.command_topic(DRONE_ID), encode(start(clock)))
+        await until(lambda: len(client.events()) == 5)
+
+        assert len(client.samples()) == seen  # not one more sample
+        assert drone.phase.value == "idle"  # and the mission completed meanwhile
+
+    async def test_a_publish_failure_just_drops_the_sample(
+        self, sampling: SimulatorRunner, client: FakeClient
+    ) -> None:
+        client.fail = True
+        await asyncio.sleep(0.1)
+        client.fail = False
+
+        await until(lambda: len(client.samples()) >= 1)  # it kept going

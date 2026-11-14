@@ -287,3 +287,69 @@ class TestEvents:
     def test_an_unknown_field_is_refused(self) -> None:
         with pytest.raises(m.ProtocolError):
             m.decode_event(json.dumps(self.event(position={"lat": 1})).encode())
+
+
+class TestTelemetry:
+    def sample(self, **extra: Any) -> dict[str, Any]:
+        return {
+            "sent_at": T0.isoformat(),
+            "latitude": 12.97,
+            "longitude": 77.59,
+            "altitude_m": 60.0,
+            "battery_percent": 83.5,
+            "phase": "flying",
+            "flight_id": str(FLIGHT_ID),
+            **extra,
+        }
+
+    def test_a_sample_round_trips(self) -> None:
+        sample = m.Telemetry.model_validate(self.sample())
+
+        assert m.decode_telemetry(m.encode(sample)) == sample
+
+    def test_a_sample_on_the_ground_has_no_flight(self) -> None:
+        raw = {k: v for k, v in self.sample(phase="idle").items() if k != "flight_id"}
+
+        assert m.decode_telemetry(json.dumps(raw).encode()).flight_id is None
+
+    def test_the_phases_are_the_drones_own_states(self) -> None:
+        assert {p.value for p in m.DronePhase} == {
+            "idle",
+            "ready",
+            "flying",
+            "paused",
+            "returning",
+            "landed",
+        }
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            {"latitude": 91},
+            {"latitude": -91},
+            {"longitude": 181},
+            {"altitude_m": -1},
+            {"altitude_m": 30_000},
+            {"battery_percent": -0.1},
+            {"battery_percent": 100.1},
+            {"phase": "hovering"},
+            {"sent_at": "2026-11-11T09:00:00"},  # naive
+            {"flight_id": "nope"},
+            {"heading": 90},  # unknown field
+        ],
+    )
+    def test_out_of_range_or_unknown_values_are_refused(self, bad: dict[str, Any]) -> None:
+        with pytest.raises(m.ProtocolError, match="telemetry"):
+            m.decode_telemetry(json.dumps(self.sample(**bad)).encode())
+
+    @pytest.mark.parametrize("payload", [b"", b"garbage", b"[]", b"{}", b"null"])
+    def test_garbage_is_a_protocol_error(self, payload: bytes) -> None:
+        with pytest.raises(m.ProtocolError):
+            m.decode_telemetry(payload)
+
+    def test_the_topics(self) -> None:
+        assert topics.telemetry_topic(DRONE_ID) == f"drones/{DRONE_ID}/telemetry"
+        assert topics.TELEMETRY_FILTER == "drones/+/telemetry"
+        assert topics.parse_telemetry_topic(topics.telemetry_topic(DRONE_ID)) == DRONE_ID
+        assert topics.parse_telemetry_topic(topics.event_topic(DRONE_ID)) is None
+        assert topics.parse_telemetry_topic("drones/+/telemetry") is None

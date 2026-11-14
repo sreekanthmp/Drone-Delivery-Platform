@@ -13,9 +13,11 @@ dependencies = [
     "geoalchemy2>=0.21.0",
     "pydantic>=2.14.3",
     "pydantic-settings>=2.16.2",
+    "redis>=8.1.0",
     "sqlalchemy[asyncio]>=2.1.8",
     "structlog>=26.1.0",
     "uvicorn>=0.54.0",
+    "websockets>=17.4",
 ]
 
 [dependency-groups]

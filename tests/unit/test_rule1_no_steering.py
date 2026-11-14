@@ -486,10 +486,19 @@ def references_command_topics(source: str) -> list[str]:
 
 
 def publishes(source: str) -> list[str]:
+    """Publishes through something that looks like an MQTT client or the MQTT port.
+
+    Redis broadcasts (``self._broadcast.publish``) are views for people, not messages to
+    drones, and are deliberately not flagged: the only way to hold an MQTT client is to import
+    one, which the layer rules confine to ``app/mqtt``, ``app/dispatch/mqtt_link.py``, the
+    simulator and the composition roots.
+    """
     return [
         f"line {node.lineno}"
         for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Attribute) and node.attr == "publish"
+        if isinstance(node, ast.Attribute)
+        and node.attr == "publish"
+        and any(hint in _receiver_text(node.value) for hint in ("mqtt", "client"))
     ]
 
 
@@ -528,15 +537,26 @@ def touches_stores(source: str) -> list[str]:
     return found
 
 
-def reaches_into_the_service(source: str) -> list[str]:
-    """Anything on ``self._dispatch`` other than ``record_progress`` (private or public)."""
+# The ONLY methods of the dispatch service each telemetry module may call. Anything else on
+# ``self._dispatch`` (a private route to the database, a command, a cancellation) is a violation.
+ALLOWED_SERVICE_CALLS = {
+    "app/telemetry/ingest.py": {"record_progress"},
+    "app/telemetry/recorder.py": {"drone_exists", "record_battery"},
+    "app/telemetry/watchdog.py": {"list_live_flights"},
+    "app/telemetry/reaper.py": {"release_stale_reservations"},
+}
+
+
+def reaches_into_the_service(source: str, allowed: set[str] | None = None) -> list[str]:
+    """Anything on ``self._dispatch`` other than the ``allowed`` methods (private or public)."""
+    permitted = allowed if allowed is not None else {"record_progress"}
     found: list[str] = []
     for node in ast.walk(ast.parse(source)):
         if (
             isinstance(node, ast.Attribute)
             and isinstance(node.value, ast.Attribute)
             and node.value.attr == "_dispatch"
-            and node.attr != "record_progress"
+            and node.attr not in permitted
         ):
             found.append(f"line {node.lineno}: _dispatch.{node.attr}")
     return found
@@ -587,7 +607,7 @@ def test_the_telemetry_ingest_has_no_store_and_cannot_publish(path: Path) -> Non
     source = path.read_text()
 
     assert touches_stores(source) == []
-    assert reaches_into_the_service(source) == []
+    assert reaches_into_the_service(source, ALLOWED_SERVICE_CALLS.get(_relative(path), set())) == []
     assert publishes(source) == []
     assert references_command_topics(source) == []
     assert builds_commands(source) == []
@@ -602,9 +622,25 @@ def test_the_worker_hands_its_ingest_a_service_that_cannot_command_a_drone() -> 
     assert publishes(source) == []
 
 
-def test_the_telemetry_scan_sees_the_ingest() -> None:
-    assert len(TELEMETRY_MODULES) >= 2
-    assert any(_relative(p) == "app/telemetry/ingest.py" for p in TELEMETRY_MODULES)
+def test_the_telemetry_scan_sees_every_module_that_reads_the_service() -> None:
+    scanned = {_relative(p) for p in TELEMETRY_MODULES}
+
+    assert set(ALLOWED_SERVICE_CALLS) <= scanned
+    assert len(TELEMETRY_MODULES) >= 6
+
+
+def test_each_telemetry_module_really_calls_only_what_it_is_allowed_to() -> None:
+    """Guards the allow-list against going stale: every entry is actually used."""
+    for relative, allowed in ALLOWED_SERVICE_CALLS.items():
+        source = (ROOT / relative).read_text()
+        used = {
+            node.attr
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "_dispatch"
+        }
+        assert used == allowed, relative
 
 
 class TestTheMqttDetectorsThemselves:
@@ -618,6 +654,17 @@ class TestTheMqttDetectorsThemselves:
     )
     def test_flags_references_to_command_topics(self, source: str) -> None:
         assert references_command_topics(source) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "await self._broadcast.publish(channel, envelope)",
+            "await self._redis.publish(channel, payload)",
+            "await self.publish(channel, envelope)",
+        ],
+    )
+    def test_allows_redis_broadcasts_which_are_views_not_drone_messages(self, source: str) -> None:
+        assert publishes(source) == []
 
     def test_allows_event_and_ack_topics(self) -> None:
         assert references_command_topics("topics.event_topic(d); topics.ack_topic(i)") == []
@@ -669,6 +716,18 @@ class TestTheMqttDetectorsThemselves:
 
     def test_the_ingest_may_call_record_progress_and_nothing_else(self) -> None:
         assert reaches_into_the_service("await self._dispatch.record_progress(a, b, c)") == []
+
+    def test_a_module_may_call_its_own_allowed_methods_but_not_the_ingests(self) -> None:
+        source = "await self._dispatch.record_battery(a, b)"
+
+        assert reaches_into_the_service(source, {"record_battery"}) == []
+        assert reaches_into_the_service(source) != []
+
+    def test_the_recorder_may_not_cancel_or_command(self) -> None:
+        allowed = ALLOWED_SERVICE_CALLS["app/telemetry/recorder.py"]
+
+        assert reaches_into_the_service("await self._dispatch.cancel_order(i)", allowed) != []
+        assert reaches_into_the_service("await self._dispatch._uow_factory()", allowed) != []
 
     def test_allows_a_module_that_only_calls_the_service(self) -> None:
         assert touches_stores("result = await self._dispatch.record_progress(a, b, c)") == []

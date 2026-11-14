@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
@@ -70,6 +70,7 @@ from app.domain.exceptions import (
 )
 from app.domain.flight_state_machine import FlightStateMachine, FlightTransitionResult
 from app.domain.models import (
+    AuditEvent,
     DenialCode,
     Drone,
     DroneStatus,
@@ -85,7 +86,7 @@ from app.domain.models import (
 )
 from app.services.exceptions import ConcurrentUpdateError, OrderNotFoundError
 from app.services.order_service import OrderService
-from app.services.ports import UnitOfWork, UnitOfWorkFactory
+from app.services.ports import AuditNotifier, UnitOfWork, UnitOfWorkFactory
 
 logger = structlog.get_logger(__name__)
 
@@ -131,6 +132,16 @@ class DispatchResult:
 
 
 @dataclass(frozen=True, slots=True)
+class StaleRelease:
+    """A flight the reaper cancelled, and what it was waiting in."""
+
+    flight_id: UUID
+    drone_id: UUID
+    order_id: UUID
+    was: FlightStatus
+
+
+@dataclass(frozen=True, slots=True)
 class CancelResult:
     order: Order
     flight: Flight | None
@@ -157,7 +168,9 @@ class DispatchService:
         id_factory: Callable[[], UUID] = uuid4,
         policy: AssignmentPolicy | None = None,
         mission_params: MissionPlanParams | None = None,
+        notifier: AuditNotifier | None = None,
     ) -> None:
+        self._notifier = notifier
         self._uow_factory = uow_factory
         self._orders = orders
         self._compliance = compliance
@@ -206,6 +219,10 @@ class DispatchService:
         if drone is None:
             raise DroneNotFoundError(drone_id)
         return drone
+
+    async def drone_exists(self, drone_id: UUID) -> bool:
+        async with self._uow_factory() as uow:
+            return await uow.drones.get(drone_id) is not None
 
     async def list_drones(self, *, status: DroneStatus | None = None) -> list[Drone]:
         async with self._uow_factory() as uow:
@@ -335,6 +352,7 @@ class DispatchService:
                 raise FlightInProgressError(order.id)
             await uow.commit()
         logger.info("flight_planned", flight_id=str(planned.flight.id), drone_id=str(drone.id))
+        await self._notify(planned.audit_event)
         return order, planned.flight, drone
 
     async def _claim_drone(
@@ -583,6 +601,7 @@ class DispatchService:
             if expected is S.MISSION_UPLOADED:
                 await self._set_drone(uow, locked.drone_id, D.ON_MISSION, only_from=_ASSIGNED)
             await uow.commit()
+        await self._notify(result.audit_event)
 
         authorization = result.start_authorization
         assert authorization is not None  # the machine always issues one on entering 'started'
@@ -951,8 +970,97 @@ class DispatchService:
         return ProgressResult(ProgressOutcome.APPLIED)
 
     # ==========================================================================================
+    # Telemetry support: battery, live flights, stale reservations
+    # ==========================================================================================
+
+    async def record_battery(self, drone_id: UUID, battery_percent: float) -> bool:
+        """Store a drone's reported battery level. ``False`` if nothing changed.
+
+        Selection judges a drone by the battery stored here, so it must not stay at its
+        registration value forever. The caller decides how often (the telemetry recorder
+        writes only when the level has moved by a few points).
+        """
+        async with self._uow_factory() as uow:
+            drone = await uow.drones.get(drone_id)
+            if drone is None or drone.battery_percent == battery_percent:
+                return False
+            updated = drone.with_battery(battery_percent, now=self._clock())  # validates
+            if not await uow.drones.set_battery(
+                drone_id, updated.battery_percent, now=updated.updated_at
+            ):
+                return False
+            await uow.commit()
+        return True
+
+    async def list_live_flights(self) -> list[Flight]:
+        """Every flight that is not finished yet (read-only; used by the watchdog)."""
+        async with self._uow_factory() as uow:
+            return await uow.flights.list_live()
+
+    async def release_stale_reservations(self, older_than: timedelta) -> list[StaleRelease]:
+        """Cancel flights that a dispatch left half-finished, and free their drones.
+
+        A dispatch takes seconds. A flight still ``planned`` or ``permission_granted`` after
+        ``older_than`` (or ``mission_uploaded`` while its order is still ``created``: the
+        crash window between the upload and the assignment) was abandoned by a dispatch that
+        died. It is cancelled and audited (source ``system``); the order stays ``created`` and
+        can be dispatched again. A *staged* flight (``mission_uploaded`` on an ``assigned``
+        order) is deliberate and is never touched, and neither is any flight that has
+        started: a silent drone in the air is an alert for a person, not a reaper's business.
+        """
+        cutoff = self._clock() - older_than
+        async with self._uow_factory() as uow:
+            candidates = await uow.flights.list_stale_preflight(cutoff)
+        released: list[StaleRelease] = []
+        for candidate in candidates:
+            current = await self._flight_or_none(candidate.id)
+            if current is None or current.status is not candidate.status:
+                continue  # it moved on meanwhile
+            if current.updated_at >= cutoff:
+                continue
+            if current.status is S.MISSION_UPLOADED:
+                order = await self._orders.get_order(current.order_id)
+                if order.status is not OrderStatus.CREATED:
+                    continue  # staged on an assigned order: legitimate
+            try:
+                await self._end_flight(
+                    current.id,
+                    S.CANCELLED,
+                    source=EventSource.SYSTEM,
+                    reason=(
+                        f"stale reservation: the dispatch left this flight in "
+                        f"{current.status.value} for over {older_than}"
+                    ),
+                    drone_to=D.AVAILABLE,
+                    drone_from=_ASSIGNED,
+                    metadata={"reaper": True, "was": current.status.value},
+                )
+            except (InvalidFlightTransitionError, ConcurrentUpdateError):
+                continue  # it moved on (or ended) while we were looking
+            released.append(
+                StaleRelease(current.id, current.drone_id, current.order_id, current.status)
+            )
+            logger.warning(
+                "stale_reservation_released",
+                flight_id=str(current.id),
+                drone_id=str(current.drone_id),
+                order_id=str(current.order_id),
+                was=current.status.value,
+            )
+        return released
+
+    # ==========================================================================================
     # Internals
     # ==========================================================================================
+
+    async def _notify(self, event: AuditEvent) -> None:
+        """Tell the live view about a change that is already committed (best-effort)."""
+        if self._notifier is None:
+            return
+        try:
+            await self._notifier.notify([event])
+        except Exception:
+            logger.exception("notify_failed", event_id=str(event.event_id))
 
     async def _require_flight(self, flight_id: UUID) -> Flight:
         flight = await self._flight_or_none(flight_id)
@@ -1005,6 +1113,7 @@ class DispatchService:
             )
             await uow.flights.apply_transition(result)
             await uow.commit()
+        await self._notify(result.audit_event)
         return result.flight
 
     async def _end_flight(
@@ -1029,6 +1138,7 @@ class DispatchService:
             if drone_to is not None:
                 await self._set_drone(uow, flight.drone_id, drone_to, only_from=drone_from)
             await uow.commit()
+        await self._notify(result.audit_event)
         return result.flight
 
     async def _end_flight_quietly(

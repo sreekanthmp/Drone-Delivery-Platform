@@ -488,3 +488,130 @@ class TestMisbehaviourForTests:
     def test_the_speed_factor_must_be_positive(self) -> None:
         with pytest.raises(ValueError, match="speed_factor"):
             SimulatedDrone(DRONE_ID, home=HOME, speed_factor=0)
+
+
+class TestSamples:
+    def test_an_idle_drone_reports_itself_on_the_ground_at_home(
+        self, drone: SimulatedDrone, clock: FakeClock
+    ) -> None:
+        sample = drone.sample()
+
+        assert (sample.latitude, sample.longitude) == (HOME.latitude, HOME.longitude)
+        assert sample.altitude_m == 0.0
+        assert sample.battery_percent == 100.0
+        assert sample.phase is wire.DronePhase.IDLE
+        assert sample.flight_id is None
+        assert sample.sent_at == clock()
+
+    def test_it_reports_the_drones_own_phase_and_flight_through_a_flight(
+        self, drone: SimulatedDrone, clock: FakeClock
+    ) -> None:
+        drone.on_command(upload())
+        assert drone.sample().phase is wire.DronePhase.READY
+        assert drone.sample().flight_id is None
+
+        drone.on_command(start(clock))
+        flying = drone.sample()
+        assert flying.phase is wire.DronePhase.FLYING
+        assert flying.flight_id == FLIGHT_ID
+
+        drone.on_command(wire.PauseMission(**envelope(n=5)))
+        assert drone.sample().phase is wire.DronePhase.PAUSED
+
+        drone.on_command(wire.ReturnToHome(**envelope(n=6)))
+        returning = drone.sample()
+        assert returning.phase is wire.DronePhase.RETURNING
+        assert returning.flight_id == FLIGHT_ID
+
+    def test_a_grounded_drone_still_names_the_flight_it_was_on(
+        self, drone: SimulatedDrone, clock: FakeClock
+    ) -> None:
+        launch(drone, clock)
+        drone.on_command(wire.Land(**envelope(n=5)))
+
+        landed = drone.sample()
+
+        assert landed.phase is wire.DronePhase.LANDED
+        assert landed.flight_id == FLIGHT_ID
+        assert landed.altitude_m == 0.0
+
+    def test_the_position_follows_the_drone_and_it_is_off_the_ground_in_flight(
+        self, drone: SimulatedDrone, clock: FakeClock
+    ) -> None:
+        launch(drone, clock)
+        fly(drone, 30)
+
+        sample = drone.sample()
+
+        assert (sample.latitude, sample.longitude) != (HOME.latitude, HOME.longitude)
+        assert sample.altitude_m > 0
+
+    def test_a_sample_is_always_a_valid_protocol_message(
+        self, drone: SimulatedDrone, clock: FakeClock
+    ) -> None:
+        launch(drone, clock)
+        for _ in range(40):
+            drone.advance(30.0)
+            assert wire.decode_telemetry(wire.encode(drone.sample())) == drone.sample()
+
+
+class TestBattery:
+    def test_it_drains_in_the_air_and_not_on_the_ground(self, clock: FakeClock) -> None:
+        drone = SimulatedDrone(DRONE_ID, home=HOME, battery_drain_per_s=0.05, clock=clock)
+        drone.advance(100.0)  # idle: nothing
+        assert drone.battery_percent == 100.0
+
+        launch(drone, clock)
+        drone.advance(100.0)
+
+        assert drone.battery_percent == pytest.approx(95.0)
+
+    def test_hovering_costs_as_much_as_flying(self, clock: FakeClock) -> None:
+        drone = SimulatedDrone(DRONE_ID, home=HOME, battery_drain_per_s=0.05, clock=clock)
+        launch(drone, clock)
+        drone.on_command(wire.PauseMission(**envelope(n=5)))
+
+        drone.advance(100.0)
+
+        assert drone.battery_percent == pytest.approx(95.0)
+
+    def test_it_never_goes_below_zero(self, clock: FakeClock) -> None:
+        drone = SimulatedDrone(
+            DRONE_ID, home=HOME, battery_drain_per_s=100.0, hold_s=1e9, clock=clock
+        )
+        launch(drone, clock)
+
+        drone.advance(50.0)
+
+        assert drone.battery_percent == 0.0
+
+    @pytest.mark.parametrize("how", ["complete", "recall", "carried"])
+    def test_a_fresh_battery_when_it_is_back_on_the_dock(self, clock: FakeClock, how: str) -> None:
+        drone = SimulatedDrone(DRONE_ID, home=HOME, battery_drain_per_s=0.05, clock=clock)
+        launch(drone, clock)
+        drone.advance(60.0)
+        assert drone.battery_percent < 100.0
+        if how == "recall":
+            drone.on_command(wire.ReturnToHome(**envelope(n=5)))
+        elif how == "carried":
+            drone.on_command(wire.Land(**envelope(n=5)))
+            drone.dock()
+        fly(drone, 4000, step=1.0)
+
+        assert drone.battery_percent == 100.0
+
+    def test_it_starts_at_the_battery_it_is_given(self, clock: FakeClock) -> None:
+        assert (
+            SimulatedDrone(DRONE_ID, home=HOME, battery_percent=42.0, clock=clock)
+            .sample()
+            .battery_percent
+            == 42.0
+        )
+
+    @pytest.mark.parametrize(
+        "bad",
+        [{"battery_percent": 101.0}, {"battery_percent": -1.0}, {"battery_drain_per_s": -0.1}],
+    )
+    def test_impossible_batteries_are_refused(self, bad: dict[str, float]) -> None:
+        with pytest.raises(ValueError, match="battery"):
+            SimulatedDrone(DRONE_ID, home=HOME, **bad)
