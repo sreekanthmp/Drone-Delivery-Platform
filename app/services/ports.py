@@ -87,6 +87,10 @@ class FlightStore(Protocol):
         """Every flight of an order, oldest first."""
         ...
 
+    async def get_live_for_drone(self, drone_id: UUID) -> Flight | None:
+        """The drone's live flight, if it has one (there is at most one)."""
+        ...
+
     async def insert(self, result: FlightTransitionResult) -> bool:
         """Store a newly planned flight together with its audit event.
 

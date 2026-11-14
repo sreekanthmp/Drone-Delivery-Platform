@@ -5,9 +5,21 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
-from app.domain.models import Location, Order, OrderStatus, Package
+from app.dispatch.service import DispatchResult
+from app.domain.models import (
+    Drone,
+    DroneStatus,
+    Flight,
+    FlightStatus,
+    Location,
+    Mission,
+    Order,
+    OrderStatus,
+    Package,
+    PermissionDenial,
+)
 
 
 class LocationOut(BaseModel):
@@ -69,4 +81,185 @@ class OrderStatusOut(BaseModel):
             status=order.status,
             is_terminal=order.status.is_terminal,
             updated_at=order.updated_at,
+        )
+
+
+# --- drones ----------------------------------------------------------------------------------
+
+
+class LocationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    latitude: float
+    longitude: float
+
+
+class DroneRegistration(BaseModel):
+    """Register a drone. A new drone is always ``available`` at its home dock."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    home: LocationIn
+    max_payload_kg: float
+    max_range_km: float
+    battery_percent: float
+
+
+class DroneOut(BaseModel):
+    id: UUID
+    name: str
+    status: DroneStatus
+    home: LocationOut
+    max_payload_kg: float
+    max_range_km: float
+    battery_percent: float
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_domain(cls, drone: Drone) -> DroneOut:
+        return cls(
+            id=drone.id,
+            name=drone.name,
+            status=drone.status,
+            home=LocationOut.from_domain(drone.home),
+            max_payload_kg=drone.max_payload_kg,
+            max_range_km=drone.max_range_km,
+            battery_percent=drone.battery_percent,
+            created_at=drone.created_at,
+            updated_at=drone.updated_at,
+        )
+
+
+# --- flights ---------------------------------------------------------------------------------
+
+
+class WaypointOut(BaseModel):
+    kind: str
+    location: LocationOut
+    altitude_m: float
+
+
+class MissionOut(BaseModel):
+    """The predefined mission uploaded to the drone (Rule 1: this is all the cloud ever sends)."""
+
+    mission_id: UUID
+    waypoints: list[WaypointOut]
+    cruise_speed_mps: float
+    estimated_duration_s: float
+    checksum: str
+
+    @classmethod
+    def from_domain(cls, mission: Mission) -> MissionOut:
+        return cls(
+            mission_id=mission.mission_id,
+            waypoints=[
+                WaypointOut(
+                    kind=w.kind.value,
+                    location=LocationOut.from_domain(w.location),
+                    altitude_m=w.altitude_m,
+                )
+                for w in mission.waypoints
+            ],
+            cruise_speed_mps=mission.cruise_speed_mps,
+            estimated_duration_s=mission.estimated_duration_s,
+            checksum=mission.checksum,
+        )
+
+
+class PermissionOut(BaseModel):
+    permission_id: str
+    issuer: str
+    issued_at: datetime
+    valid_from: datetime
+    valid_until: datetime
+
+
+class DenialOut(BaseModel):
+    code: str
+    reason: str
+
+    @classmethod
+    def from_domain(cls, denial: PermissionDenial) -> DenialOut:
+        return cls(code=denial.code.value, reason=denial.reason)
+
+
+class FlightOut(BaseModel):
+    id: UUID
+    order_id: UUID
+    drone_id: UUID
+    status: FlightStatus
+    mission: MissionOut
+    permission: PermissionOut | None
+    denial: DenialOut | None
+    acknowledged_checksum: str | None
+    failure_reason: str | None
+    started_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_domain(cls, flight: Flight) -> FlightOut:
+        permission = flight.permission
+        return cls(
+            id=flight.id,
+            order_id=flight.order_id,
+            drone_id=flight.drone_id,
+            status=flight.status,
+            mission=MissionOut.from_domain(flight.mission),
+            permission=(
+                None
+                if permission is None
+                else PermissionOut(
+                    permission_id=permission.permission_id,
+                    issuer=permission.issuer,
+                    issued_at=permission.issued_at,
+                    valid_from=permission.valid_from,
+                    valid_until=permission.valid_until,
+                )
+            ),
+            denial=None if flight.denial is None else DenialOut.from_domain(flight.denial),
+            acknowledged_checksum=flight.acknowledged_checksum,
+            failure_reason=flight.failure_reason,
+            started_at=flight.started_at,
+            created_at=flight.created_at,
+            updated_at=flight.updated_at,
+        )
+
+
+class CommandReason(BaseModel):
+    """The only input a flight command takes besides the flight's id (Rule 1)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, min_length=1, max_length=300)
+
+
+class DispatchOut(BaseModel):
+    """What a dispatch did. ``outcome`` is the result; a refusal is a normal, retryable one."""
+
+    outcome: str
+    succeeded: bool
+    order: OrderOut
+    flight: FlightOut | None
+    drone: DroneOut | None
+    rejections: dict[str, list[str]]
+    """For ``no_drone_available``: each drone that was considered, and why it was rejected."""
+
+    detail: str | None
+
+    @classmethod
+    def from_domain(cls, result: DispatchResult) -> DispatchOut:
+        return cls(
+            outcome=result.outcome.value,
+            succeeded=result.succeeded,
+            order=OrderOut.from_domain(result.order),
+            flight=None if result.flight is None else FlightOut.from_domain(result.flight),
+            drone=None if result.drone is None else DroneOut.from_domain(result.drone),
+            rejections={
+                str(drone_id): [reason.value for reason in reasons]
+                for drone_id, reasons in result.rejections.items()
+            },
+            detail=result.detail,
         )

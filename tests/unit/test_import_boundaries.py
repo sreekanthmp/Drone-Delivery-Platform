@@ -12,12 +12,14 @@ Layers and what each may import (besides the standard library):
 ``app/dispatch``      structlog, ``app.domain``, ``app.compliance``, ``app.services``,
                       ``app.dispatch``
 ``app/api``           FastAPI/Starlette/Pydantic/structlog, ``app.domain``,
-                      ``app.services``, ``app.adapters``, ``app.api``
+                      ``app.services``, ``app.adapters``, ``app.api``, and from dispatch
+                      only ``app.dispatch.service`` and ``app.dispatch.exceptions``
 ====================  ==============================================================
 
 So partner formats (adapters) never reach core code; core never imports the HTTP layer or
-the adapters; and HTTP handlers never touch the database layer. ``app/main.py`` is the
-composition root and may import across layers.
+the adapters; and HTTP handlers never touch the database layer or the drone link (Rule 1:
+only the dispatch service talks to drones). ``app/main.py`` is the composition root and may
+import across layers.
 
 A second check keeps partner *names* out of everything except ``app/adapters``.
 """
@@ -58,9 +60,20 @@ RULES: dict[str, LayerRule] = {
         frozenset({"structlog"}),
         frozenset({"app.domain", "app.compliance", "app.services", "app.dispatch"}),
     ),
+    # Handlers may call the dispatch service and render its errors, but never import the
+    # drone link: the service is the only thing that may talk to a drone (Rule 1).
     "app/api": LayerRule(
         frozenset({"fastapi", "starlette", "pydantic", "structlog"}),
-        frozenset({"app.domain", "app.services", "app.adapters", "app.api"}),
+        frozenset(
+            {
+                "app.domain",
+                "app.services",
+                "app.adapters",
+                "app.api",
+                "app.dispatch.service",
+                "app.dispatch.exceptions",
+            }
+        ),
     ),
 }
 
@@ -158,6 +171,31 @@ class TestTheDetectorItself:
     )
     def test_flags_the_api_reaching_for_the_database(self, source: str) -> None:
         assert find_boundary_violations(source, self.API) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from app.dispatch.link import DroneLink",
+            "from app.dispatch.in_memory_link import InMemoryDroneLink",
+            "from app.dispatch.mission import plan_mission",
+            "from app.dispatch.assignment import select_drone",
+            "import app.dispatch.link",
+            "from app.compliance.mock_digital_sky import MockDigitalSky",
+        ],
+    )
+    def test_flags_the_api_reaching_the_drone_link_or_dispatch_internals(self, source: str) -> None:
+        """Rule 1: a route handler must not be able to talk to a drone directly."""
+        assert find_boundary_violations(source, self.API) != []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from app.dispatch.service import DispatchService",
+            "from app.dispatch.exceptions import FlightNotFoundError",
+        ],
+    )
+    def test_allows_the_api_to_use_the_dispatch_service_and_its_errors(self, source: str) -> None:
+        assert find_boundary_violations(source, self.API) == []
 
     @pytest.mark.parametrize(
         "source",

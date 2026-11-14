@@ -193,7 +193,13 @@ class TestErrors:
         }
 
     @pytest.mark.parametrize(
-        ("code", "status"), [(ErrorCode.NOT_FOUND, 404), (ErrorCode.INTERNAL_ERROR, 500)]
+        ("code", "status"),
+        [
+            (ErrorCode.NOT_FOUND, 404),
+            (ErrorCode.CONFLICT, 409),
+            (ErrorCode.UNAVAILABLE, 503),
+            (ErrorCode.INTERNAL_ERROR, 500),
+        ],
     )
     def test_other_errors(self, code: ErrorCode, status: int) -> None:
         response = adapter.render_error(ClientError(code, "x"))

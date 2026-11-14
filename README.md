@@ -77,13 +77,14 @@ Only internal types cross into `OrderService`.
 |---|---|---|
 | `POST /partner/{client_id}/orders` | partner | Parse via the adapter, create the order. `201` if new, `200` if the partner's id was already seen (idempotent) |
 | `GET /partner/{client_id}/orders/{external_order_id}` | partner | Look up by the partner's own id; partner-format body |
+| `POST /partner/{client_id}/orders/{external_order_id}/cancel` | partner | Cancel (idempotent). A flying drone is recalled first; see [Cancellation](#cancellation) |
 | `GET /internal/orders/{order_id}` | internal | Platform-format order |
 | `GET /internal/orders/{order_id}/status` | internal | Status, terminal flag, last update |
 | `GET /health`, `GET /ready` | ops | Liveness; readiness (checks the database) |
 
 There is no `PUT`/`PATCH`/`DELETE` and no endpoint that accepts a status: orders move only
-through the state machine (Rule 4). Cancellation is not exposed yet, because cancelling an
-in-flight order must also recall the drone, which belongs to dispatch.
+through the state machine (Rule 4). The internal endpoints for drones, flights and dispatch
+are described under [Dispatch, drone commands and cancellation](#dispatch-drone-commands-and-cancellation).
 
 Integrations: `mock` (generic, for development and tests), `swiggy` and `zomato`.
 
@@ -169,7 +170,7 @@ started | paused -> aborted            started -> completed
 Anything else raises a specific error (`PermissionRevokedError`, `PermissionExpiredError`,
 `PermissionWindowTooShortError`, ...) and nothing is persisted. A successful start also yields
 a `StartAuthorization`, a token only the state machine can create, which the drone link
-(next phase) will require before it sends a start command.
+requires before it will send a start command.
 
 **Safety commands are never gated.** Pause, abort (return-to-home, land) and complete do not
 consult the permission: they must work even if it has expired or been revoked.
@@ -179,7 +180,7 @@ consult the permission: they must work even if it has expired or been revoked.
 | Domain | `FlightStateMachine` checks all four conditions; `FlightTransitionResult` refuses to exist without a matching `StartAuthorization` for every entry into `started`, and for nothing else |
 | Architecture | `tests/unit/test_no_direct_status_writes.py` bans minting a `StartAuthorization` anywhere else, and bans writing flights or drones outside the dispatch service |
 | Database | `flights_enforce_lifecycle` (deferred constraint trigger): valid edge, audit row from the *same transaction*, write-once mission/permission columns, and for `started` a stored permission, an acknowledged mission, a permission still in force *and* long enough |
-| Database | At most one live flight per drone and per order (partial unique indexes): a drone cannot be double-booked. Drone listing uses `FOR UPDATE SKIP LOCKED` and status changes are compare-and-set |
+| Database | At most one live flight per drone and per order (partial unique indexes): a drone cannot be double-booked. Drone status changes are compare-and-set; dispatch claims the drone it chose that way (the store can also list drones with `FOR UPDATE SKIP LOCKED`, which dispatch deliberately does not use: see the Decisions Log) |
 
 The database cannot see the provider re-check, so a raw start that satisfies its data
 conditions is accepted; the Python gate is what insists on the fresh re-check. The trigger
@@ -200,9 +201,114 @@ higher battery, then lowest id; every ruled-out drone is reported with its reaso
 A **mission** is data (waypoints and a checksum). The cloud uploads it and may later send
 start / pause / return-to-home / land; the drone flies it (Rule 1).
 
-> Phase 4A delivers the domain, compliance interface and mock, selection, persistence and the
-> database guards. There is no HTTP API for flights yet, and no drone link: the dispatch
-> workflow, mission planner, commands and cancellation are Phase 4B.
+## Dispatch, drone commands and cancellation
+
+`DispatchService` (`app/dispatch/service.py`) is the only code that writes flights and drones
+and the only code that talks to a drone (architecture tests enforce both). It never changes an
+order itself: it asks `OrderService`, so the order state machine stays the single door (Rule 4).
+
+### The drone link (Rule 1)
+
+`DroneLink` (`app/dispatch/link.py`) has exactly five operations: **upload a mission**,
+**start**, **pause**, **return to home**, **land**. Their parameters are only a drone id, a
+mission, and (for start) the `StartAuthorization` from the Rule 2 gate: there is no way to hand
+a drone a position, heading, speed or status. A mission is a short list of high-level waypoints
+(takeoff, pickup, dropoff, return, land) planned by `app/dispatch/mission.py` as a straight-line
+sortie at fixed altitudes; the drone's own controller flies it. Failures are either
+*rejected* (the drone definitely did not act) or *no acknowledgement* (unknown: it may have).
+
+Only an **in-memory stand-in** exists (`DRONE_LINK=in_memory`): it behaves like a well-mannered
+drone (acknowledges uploads by checksum, checks the start authorisation) and can be told to
+fail, for tests. The MQTT link replaces it with telemetry in Phase 5.
+
+### The dispatch workflow (Rule 2)
+
+`POST /internal/orders/{order_id}/dispatch` (add `?start=false` to stage the mission without
+starting). Each step is its own short transaction (no transaction is held across a network call,
+and each step re-reads the flight under a lock):
+
+1. choose the best suitable drone, **claim** it (compare-and-set), plan the mission, create the
+   `planned` flight;
+2. request permission from the compliance provider (an outage counts as a denial);
+3. validate the granted permission;
+4. upload the mission: the drone must echo its checksum;
+5. only now move the order `created -> assigned`, so `assigned` means *ready to fly*;
+6. start the flight: the Rule 2 gate runs and is **recorded before** the start command is sent.
+
+What each ending leaves behind (every row that leaves the order `created` is safely retryable;
+a retry plans a new flight and the old one stays in the history):
+
+| Outcome | Flight | Drone | Order | Reached the drone |
+|---|---|---|---|---|
+| `started` | `started` | `on_mission` | `assigned` | upload, start |
+| `ready` (`start=false`) | `mission_uploaded` | `assigned` | `assigned` | upload |
+| `no_drone_available` | none | untouched | `created` | nothing |
+| `permission_denied` (incl. provider outage) | `permission_denied` | `available` | `created` | nothing |
+| `permission_invalid` (revoked/expired right after the grant) | `cancelled` | `available` | `created` | nothing |
+| `upload_failed` (refused, no answer, or wrong checksum) | `upload_failed` | `available` | `created` | upload (maybe) |
+| `cancelled_during_dispatch` | `cancelled` | `available` | `cancelled` | up to upload |
+| `start_failed`: the gate refused | `cancelled` | `available` | `failed` | upload |
+| `start_failed`: the drone refused the start | `aborted` | `available` | `failed` | upload |
+| `start_failed`: the start went unanswered | `aborted` | `returning` | `failed` | upload, start, return-to-home |
+
+Dispatch answers **200 with an `outcome`** for all of these: a refusal is a normal, well-defined
+result, not a request error. `404` means an unknown order; `409` means the order is not
+`created` or already has a live flight.
+
+### Flight commands
+
+| Endpoint | Does | Gated by permission? |
+|---|---|---|
+| `POST /internal/flights/{id}/start` | start a staged flight | **yes** (Rule 2 gate) |
+| `POST /internal/flights/{id}/resume` | resume a paused flight | **yes**, same gate |
+| `POST /internal/flights/{id}/pause` | pause a flying mission | never |
+| `POST /internal/flights/{id}/return-to-home` | recall the drone; aborts the flight | never |
+| `POST /internal/flights/{id}/land` | land where it is; aborts the flight | never |
+| `GET /internal/flights/{id}`, `GET /internal/orders/{id}/flights` | read | |
+
+Return-to-home and land accept an optional `{"reason": "..."}` and nothing else. Two orderings,
+each failing in its safe direction: **start and resume record the intent first, then send** (a
+lost command is then undone: the flight is aborted and a return-to-home is sent as a
+precaution), whereas **pause, return-to-home and land send first, then record** (if the drone
+does not confirm, nothing is recorded and the caller gets a retryable `503`). A *refused*
+resume puts the flight back to `paused`, because the drone is still hovering where it was.
+
+| Error | When |
+|---|---|
+| `409 permission_refused` | the Rule 2 gate refused a start or resume; nothing changed, nothing was sent |
+| `409 conflict` | not allowed in the current state (flight, drone or order) |
+| `503 command_not_confirmed` | the drone did not confirm a pause/return/land; nothing was recorded; retry |
+| `502 start_failed` | the drone did not take the start; the flight was cleaned up (see above) |
+
+### Fleet endpoints
+
+`POST /internal/drones` (register; a new drone is `available`), `GET /internal/drones`,
+`GET /internal/drones/{id}`, and two verbs: `POST .../docked` (operations confirms a recalled
+or grounded drone is back at its dock) and `POST .../maintenance`. Neither accepts a status;
+both refuse a drone that has a live flight, and any change the drone's state machine forbids.
+
+### Cancellation
+
+`POST /partner/{client_id}/orders/{external_order_id}/cancel`, answered in the partner's own
+format. A not-yet-flying order is simply cancelled (a staged flight is cancelled and its drone
+released). If the drone is **flying, it is recalled first**, and only when it confirms are the
+flight aborted and the order cancelled. **If the recall cannot be confirmed the order is not
+cancelled**: the partner gets `503` (retry), because a cancelled order must never leave a
+drone flying. Cancelling an already-cancelled order is a no-op; a finished order (delivered,
+failed, returned) answers `409`.
+
+### Known limits of this phase
+
+- A crash between dispatch steps can leave a drone `assigned` and a flight live (there is no
+  reaper). Cancelling the order, or `docked` once the flight is over, releases it.
+- After a recall or landing the drone stays `returning`/`offline` until operations calls
+  `docked` (nothing reports its position until telemetry exists in Phase 5).
+- A refused or failed command is **logged**, not audited: the audit trail records status
+  changes, and a command that changed nothing is in the structured log.
+- A cancelled flight's mission may remain on the drone until the next upload replaces it
+  (there is deliberately no "clear mission" command).
+- The database gate cannot see the provider re-check and uses the database clock (see above).
+- Still no authentication, billing or real Digital Sky integration (none has been requested).
 
 ## Development
 
@@ -262,7 +368,7 @@ database can never look like a green run.
 | 2 | Persistence and audit: PostgreSQL/PostGIS, async SQLAlchemy, Alembic, `OrderService`, append-only audit table, DB lifecycle guard | **done** |
 | 3 | Client adapters (mock, Swiggy, Zomato) and order API, Dockerfile | **done** |
 | 4A | Drones, compliance (mock Digital Sky) and the flight lifecycle: flight state machine with the Rule 2 start gate, drone selection, drone/flight persistence and database guards | **done** |
-| 4B | Dispatch workflow, mission planner, drone link (start/pause/RTH/land), cancellation, internal dispatch API | planned |
+| 4B | Dispatch workflow, mission planner, drone link (start/pause/RTH/land), cancellation, internal dispatch API | **done** |
 | 5 | Telemetry: MQTT ingest, Redis, WebSockets, drone simulator | planned |
 | 6 | Webhooks: sender, retries, idempotency, failure tracking | planned |
 | 7 | Ops dashboard APIs, hardening, end-to-end tests | planned |
@@ -333,3 +439,22 @@ database can never look like a green run.
 - [2026-11-12] Drone battery and position are set at registration (and by operations) until telemetry exists, and drone status changes are not audited separately: flight events record the meaningful changes.
 - [2026-11-12] Drone selection is a pure function with an explicit policy (minimum battery, range reserve, maximum pickup distance) and deterministic tie-breaks: the same inputs always choose the same drone, and every rejection carries its reasons.
 - [2026-11-12] `orders.drone_id` now references the `drones` registry (RESTRICT), delivering the foreign key the Phase 2 decision on plain-UUID drone ids deferred: an order can only be assigned to a registered drone, so tests and fixtures register drones first.
+- [2026-11-14] A start that fails after the order is `assigned` fails the order (user-approved): orders have no way back from `assigned`, so an order whose drone never left must end `failed` rather than hang.
+- [2026-11-14] `dispatch` starts the flight by default and `start=false` stages it with the mission on board (user-approved): the common case is one call, and staging lets operations hold a flight (and exercises the gate separately).
+- [2026-11-14] Cancelling an in-flight order recalls the drone first, and if the recall cannot be confirmed the order is NOT cancelled and the caller gets a retryable error (user-approved): a cancelled order must never leave a drone flying.
+- [2026-11-14] `DispatchService` is the only writer of flights and drones and the only caller of the drone link, and it changes orders only through `OrderService`: architecture tests enforce each (Rules 1, 2 and 4), and API handlers may import the service and its errors but never the link.
+- [2026-11-14] The drone link has exactly five operations and no parameter that can carry a position, heading, speed or status; `start` requires the `StartAuthorization` from the gate: Rule 1 is a property of the port's shape, checked by signature, by OpenAPI inspection and by a scan for steering-named code.
+- [2026-11-14] Link failures are either `CommandRejectedError` (the drone definitely did not act) or `NoAcknowledgementError` (unknown): recovery differs (a refused start frees the drone, an unanswered one recalls it), and a timeout must never be read as "it did not happen".
+- [2026-11-14] Start and resume record the intent then send; pause, return-to-home and land send then record: a lost start must fail safe (abort and recall), while a lost stop must not leave a record claiming the drone is still flying. An unconfirmed stop records nothing and is retryable.
+- [2026-11-14] Pause, return-to-home, land and the cancellation recall never consult the compliance provider, and a structural test proves their code cannot: stopping a drone must never be blocked by paperwork or an outage.
+- [2026-11-14] A refused resume puts the flight back to `paused` and leaves the drone and order alone, while an unanswered resume recalls and aborts (found while testing: aborting after a refusal would have marked a hovering drone `available`).
+- [2026-11-14] Dispatch answers 200 with an `outcome` for every result the workflow handled, including refusals: each leaves the system consistent and the order retryable, so none is a request error; 404/409 are reserved for an unknown order and an order that cannot be dispatched.
+- [2026-11-14] Dispatch claims only the drone it chose, by compare-and-set, and re-chooses when it loses the claim, instead of locking every candidate with `FOR UPDATE SKIP LOCKED` as the 4A store allows: a concurrency test showed the lock-all approach made 12 concurrent dispatches use 1 of 3 drones (each deciding dispatch hid every drone from the rest, which wrongly reported "no drone"). It never double-booked, but it refused orders it could serve. The store option stays; dispatch no longer uses it.
+- [2026-11-14] `PERMISSION_VALIDITY_MINUTES` now defaults to 60 and the composition root passes it to the mock provider: a typical sortie is estimated at ~22 minutes and the gate refuses a permission that ends before the mission would, so the old 15-minute default meant no dispatch could ever start.
+- [2026-11-14] The planner produces a straight-line, fixed-altitude sortie of five waypoints with a documented duration formula and a 15% margin, with no airspace, terrain or weather modelling: enough for the gate to judge validity against, and honest about what it is not.
+- [2026-11-14] A crash between dispatch steps can leak a reservation and there is no reaper; cancelling the order or `docked` is the manual remedy: automatic recovery needs telemetry to know what a drone is really doing, so it belongs with Phase 5.
+- [2026-11-14] Failed commands are logged, not audited (no migration 0003): the audit trail records status changes (Rule 5), and a command that changed nothing is in the structured log; auditing attempts would need a new event type.
+- [2026-11-14] `docked` and `maintenance` are operational verbs (not status writes) and refuse a drone with a live flight; the drone list has no `status` filter, so the invariant "no endpoint has an input named like `status`" stays absolute and is tested over OpenAPI.
+- [2026-11-14] Partner cancellation maps a finished order to a new `CONFLICT` (409) error kind and an unconfirmed recall to `UNAVAILABLE` (503), rendered by every adapter in its own format: partners learn what to do (stop, or retry) without seeing internals.
+- [2026-11-14] Only an in-memory drone link exists (`DRONE_LINK=in_memory`): the MQTT link arrives with telemetry in Phase 5, and nothing that would pretend to reach a real drone is built before then.
+- [2026-11-14] Dispatch locks the order row while it decides, so a concurrent dispatch and cancel (or ten dispatches) of one order are serialised by the database; the one-live-flight indexes remain the backstop, and a mutation check showed that removing the lock is caught by the concurrent HTTP test.

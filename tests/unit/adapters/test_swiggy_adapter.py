@@ -191,6 +191,8 @@ class TestErrors:
         ("code", "status", "label"),
         [
             (ErrorCode.NOT_FOUND, 404, "NOT_FOUND"),
+            (ErrorCode.CONFLICT, 409, "CONFLICT"),
+            (ErrorCode.UNAVAILABLE, 503, "UNAVAILABLE"),
             (ErrorCode.INTERNAL_ERROR, 500, "INTERNAL_ERROR"),
         ],
     )

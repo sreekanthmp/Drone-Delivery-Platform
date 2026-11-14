@@ -24,7 +24,13 @@ class Settings(BaseSettings):
 
     # Only the mock exists: a real Digital Sky integration is not built until requested.
     compliance_provider: Literal["mock"] = "mock"
-    permission_validity_minutes: int = Field(default=15, ge=1)
+    permission_validity_minutes: int = Field(default=60, ge=1)
+    """How long the mock grants a permission. A typical sortie is estimated at ~22 minutes,
+    and the start gate refuses a permission that ends before the mission would, so keep this
+    comfortably above the longest sortie you expect."""
+
+    # Only the in-memory link exists until the MQTT link is built (telemetry phase).
+    drone_link: Literal["in_memory"] = "in_memory"
 
     @field_validator("database_url")
     @classmethod

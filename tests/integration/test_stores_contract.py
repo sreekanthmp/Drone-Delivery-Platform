@@ -326,6 +326,27 @@ class TestFlightStore:
 
         assert [f.id for f in listed] == [first.id, second.id, third.id]
 
+    async def test_the_live_flight_of_a_drone(
+        self, world: tuple[UnitOfWorkFactory, Order, Order]
+    ) -> None:
+        factory, order, other_order = world
+        flow = FlightFlow(factory)
+        async with factory() as uow:
+            assert await uow.flights.get_live_for_drone(DRONE_ID) is None
+
+        await flow.flight_in(S.CANCELLED, order.id, DRONE_ID)  # finished flights are not live
+        async with factory() as uow:
+            assert await uow.flights.get_live_for_drone(DRONE_ID) is None
+
+        live = await flow.plan(other_order.id, DRONE_ID)
+        async with factory() as uow:
+            assert await uow.flights.get_live_for_drone(DRONE_ID) == live
+            assert await uow.flights.get_live_for_drone(OTHER_DRONE) is None  # another drone
+
+        await flow.advance(live, S.CANCELLED)
+        async with factory() as uow:
+            assert await uow.flights.get_live_for_drone(DRONE_ID) is None
+
     async def test_a_drone_can_have_only_one_live_flight(
         self, world: tuple[UnitOfWorkFactory, Order, Order]
     ) -> None:

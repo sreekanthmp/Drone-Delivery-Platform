@@ -27,11 +27,12 @@ from app.adapters.base import (
     FieldIssue,
 )
 from app.adapters.registry import AdapterRegistry, UnknownClientError
-from app.api.deps import AdapterRegistryDep, OrderServiceDep
+from app.api.deps import AdapterRegistryDep, DispatchServiceDep, OrderServiceDep
 from app.api.errors import error_response
-from app.domain.exceptions import OrderValidationError
+from app.dispatch.exceptions import CommandNotConfirmedError, FlightInProgressError
+from app.domain.exceptions import InvalidTransitionError, OrderValidationError
 from app.domain.models import EventSource
-from app.services.exceptions import OrderNotFoundError
+from app.services.exceptions import ConcurrentUpdateError, OrderNotFoundError
 
 logger = structlog.get_logger(__name__)
 
@@ -64,6 +65,20 @@ async def _respond(
         response = adapter.render_error(ClientError(ErrorCode.INVALID_REQUEST, str(exc)))
     except OrderNotFoundError:
         response = adapter.render_error(ClientError(ErrorCode.NOT_FOUND, "order not found"))
+    except InvalidTransitionError as exc:
+        response = adapter.render_error(ClientError(ErrorCode.CONFLICT, str(exc)))
+    except (ConcurrentUpdateError, FlightInProgressError):
+        response = adapter.render_error(
+            ClientError(ErrorCode.CONFLICT, "the order is being changed; try again")
+        )
+    except CommandNotConfirmedError:
+        # The drone could not be recalled, so the order was deliberately NOT cancelled.
+        response = adapter.render_error(
+            ClientError(
+                ErrorCode.UNAVAILABLE,
+                "the order was not cancelled because the drone could not be recalled; retry",
+            )
+        )
     except Exception:
         # Last line of defence at the boundary: log everything, tell the partner nothing internal.
         logger.exception("partner_request_failed", client_id=adapter.client_id)
@@ -119,5 +134,33 @@ async def get_order(
     async def action() -> ClientResponse:
         order = await service.get_order_by_external_id(client_id, external_order_id)
         return adapter.render_order(order, created=False)
+
+    return await _respond(adapter, action)
+
+
+@router.post("/{client_id}/orders/{external_order_id}/cancel")
+async def cancel_order(
+    client_id: str,
+    external_order_id: str,
+    orders: OrderServiceDep,
+    dispatch: DispatchServiceDep,
+    registry: AdapterRegistryDep,
+) -> JSONResponse:
+    """Cancel an order. If its drone is flying it is recalled first.
+
+    Idempotent for an order that is already cancelled. An order that has finished
+    (delivered, failed, returned) answers 409 in the partner's error format; if the drone
+    cannot be recalled the order is NOT cancelled and the answer is 503 (retry).
+    """
+    adapter = _adapter_or_404(registry, client_id)
+    if isinstance(adapter, JSONResponse):
+        return adapter
+
+    async def action() -> ClientResponse:
+        order = await orders.get_order_by_external_id(client_id, external_order_id)
+        result = await dispatch.cancel_order(
+            order.id, source=EventSource.ADAPTER, reason="cancelled by the partner"
+        )
+        return adapter.render_order(result.order, created=False)
 
     return await _respond(adapter, action)

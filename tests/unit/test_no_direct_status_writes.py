@@ -66,8 +66,8 @@ REPLACE_STATUS_HOMES = {
     "app/domain/flight_state_machine.py",
     "app/domain/models/drone.py",
 }
-# Who may call each store's write methods. The flight and drone homes are the dispatch
-# service, which arrives in the next phase; until then nothing may call them.
+# Who may call each store's write methods: the order service for orders, and the dispatch
+# service for flights and drones (it is the only code that may write them).
 STORE_WRITE_HOMES: dict[str, set[str]] = {
     "orders": {"app/services/order_service.py"},
     "flights": {"app/dispatch/service.py"},

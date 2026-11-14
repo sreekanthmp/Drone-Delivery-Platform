@@ -15,12 +15,20 @@ class ErrorCode(StrEnum):
 
     INVALID_REQUEST = "invalid_request"
     NOT_FOUND = "not_found"
+    CONFLICT = "conflict"
+    """The request is valid but the order is not in a state that allows it."""
+
+    UNAVAILABLE = "unavailable"
+    """Temporarily unable to do it (for example a drone that cannot be reached): retry later."""
+
     INTERNAL_ERROR = "internal_error"
 
 
 HTTP_STATUS_FOR_ERROR: Final[Mapping[ErrorCode, int]] = {
     ErrorCode.INVALID_REQUEST: 422,
     ErrorCode.NOT_FOUND: 404,
+    ErrorCode.CONFLICT: 409,
+    ErrorCode.UNAVAILABLE: 503,
     ErrorCode.INTERNAL_ERROR: 500,
 }
 

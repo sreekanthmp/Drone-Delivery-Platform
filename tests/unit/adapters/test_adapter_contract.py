@@ -13,6 +13,7 @@ from uuid import UUID
 import pytest
 
 from app.adapters.base import (
+    HTTP_STATUS_FOR_ERROR,
     AdapterValidationError,
     ClientAdapter,
     ClientError,
@@ -131,6 +132,8 @@ class TestEveryAdapter:
         [
             (ErrorCode.INVALID_REQUEST, 422),
             (ErrorCode.NOT_FOUND, 404),
+            (ErrorCode.CONFLICT, 409),
+            (ErrorCode.UNAVAILABLE, 503),
             (ErrorCode.INTERNAL_ERROR, 500),
         ],
     )
@@ -199,3 +202,12 @@ class TestFlightEventsAreNeverRenderedForPartners:
 
         with pytest.raises(ValueError, match="different order"):
             adapter.render_status_update(order, event_for(other, OrderStatus.CREATED))
+
+
+def test_every_error_code_has_an_http_status_and_every_adapter_renders_it() -> None:
+    """A new platform error kind cannot be added without a status and a rendering for it."""
+    assert set(HTTP_STATUS_FOR_ERROR) == set(ErrorCode)
+    for adapter in ADAPTERS:
+        for code in ErrorCode:
+            response = adapter.render_error(ClientError(code, "x"))
+            assert response.status_code == HTTP_STATUS_FOR_ERROR[code]

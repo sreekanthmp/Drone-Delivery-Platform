@@ -20,6 +20,7 @@ from app.db.repositories.audit import SqlAlchemyAuditLog
 from app.domain.exceptions import FlightValidationError
 from app.domain.flight_state_machine import FlightTransitionResult
 from app.domain.models import (
+    LIVE_FLIGHT_STATES,
     AuditEventType,
     DenialCode,
     Flight,
@@ -116,6 +117,19 @@ class SqlAlchemyFlightStore:
             .execution_options(populate_existing=True)
         )
         return [_to_domain(record) for record in records]
+
+    async def get_live_for_drone(self, drone_id: UUID) -> Flight | None:
+        record = (
+            await self._session.scalars(
+                select(FlightRecord)
+                .where(
+                    FlightRecord.drone_id == drone_id,
+                    FlightRecord.status.in_([status.value for status in LIVE_FLIGHT_STATES]),
+                )
+                .execution_options(populate_existing=True)
+            )
+        ).one_or_none()
+        return None if record is None else _to_domain(record)
 
     async def insert(self, result: FlightTransitionResult) -> bool:
         flight, event = result.flight, result.audit_event

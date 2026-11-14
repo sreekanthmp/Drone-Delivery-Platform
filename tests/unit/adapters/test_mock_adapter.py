@@ -185,6 +185,8 @@ class TestErrors:
         [
             (ErrorCode.INVALID_REQUEST, 422),
             (ErrorCode.NOT_FOUND, 404),
+            (ErrorCode.CONFLICT, 409),
+            (ErrorCode.UNAVAILABLE, 503),
             (ErrorCode.INTERNAL_ERROR, 500),
         ],
     )

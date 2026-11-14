@@ -17,7 +17,14 @@ def make(**env: str) -> Settings:
 
 class TestDefaults:
     def test_local_development_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        for name in ("DATABASE_URL", "DATABASE_ECHO", "LOG_LEVEL", "LOG_JSON"):
+        for name in (
+            "DATABASE_URL",
+            "DATABASE_ECHO",
+            "LOG_LEVEL",
+            "LOG_JSON",
+            "PERMISSION_VALIDITY_MINUTES",
+            "DRONE_LINK",
+        ):
             monkeypatch.delenv(name, raising=False)
 
         settings = make()
@@ -29,7 +36,8 @@ class TestDefaults:
         assert settings.log_level == "INFO"
         assert settings.log_json is False
         assert settings.compliance_provider == "mock"
-        assert settings.permission_validity_minutes == 15
+        assert settings.permission_validity_minutes == 60
+        assert settings.drone_link == "in_memory"
 
 
 class TestEnvironmentOverrides:
@@ -76,10 +84,27 @@ class TestCompliance:
         with pytest.raises(ValidationError):
             make(compliance_provider=provider)
 
+    def test_the_default_validity_outlasts_a_typical_sortie(self) -> None:
+        """The start gate refuses a permission that ends before the mission would (~22 min)."""
+        assert make().permission_validity_minutes >= 30
+
     @pytest.mark.parametrize("minutes", ["0", "-5"])
     def test_the_validity_must_be_positive(self, minutes: str) -> None:
         with pytest.raises(ValidationError):
             make(permission_validity_minutes=minutes)
+
+
+class TestDroneLink:
+    def test_only_the_in_memory_link_exists(self) -> None:
+        """The MQTT link is built with telemetry; nothing else may be selected until then."""
+        for link in ("mqtt", "real", "", "IN_MEMORY"):
+            with pytest.raises(ValidationError):
+                make(drone_link=link)
+
+    def test_it_comes_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DRONE_LINK", "in_memory")
+
+        assert make().drone_link == "in_memory"
 
 
 class TestValidation:

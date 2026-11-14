@@ -128,6 +128,12 @@ class _FlightStore:
         flights = [f for f in self._flights.values() if f.order_id == order_id]
         return sorted(flights, key=lambda f: (f.created_at, f.id))
 
+    async def get_live_for_drone(self, drone_id: UUID) -> Flight | None:
+        return next(
+            (f for f in self._flights.values() if f.drone_id == drone_id and f.status.is_live),
+            None,
+        )
+
     async def insert(self, result: FlightTransitionResult) -> bool:
         if result.audit_event.event_type is not AuditEventType.FLIGHT_CREATED:
             raise ValueError("insert() needs a result produced by FlightStateMachine.create()")
