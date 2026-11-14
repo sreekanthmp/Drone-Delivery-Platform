@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from uuid import UUID, uuid4
@@ -10,8 +11,10 @@ import httpx
 import pytest
 
 from app.demo.__main__ import PAGE, add_demo_routes
-from app.demo.demo import DOCKS, Demo, LoopbackMqtt, build_demo
+from app.demo.demo import DOCKS, Demo, LoopbackMqtt, MockPartner, build_demo
 from app.simulator.drone import Phase
+from app.webhooks.retry import RetryPolicy
+from app.webhooks.signing import sign
 
 ORDER = {
     "pickup": {"lat": 12.9716, "lng": 77.5946},
@@ -243,3 +246,211 @@ class TestTheLoopback:
 
         with pytest.raises(ConnectionError):
             await loopback.publish("drones/00000000-0000-0000-0000-000000000001/commands", b"{}")
+
+
+# --- the partner's webhooks ---------------------------------------------------------------
+
+
+@pytest.fixture
+async def quick() -> AsyncIterator[Demo]:
+    """A demo whose retries are quick, so a partner that was down catches up within the test."""
+    built = await build_demo(
+        speed=60.0, webhook_policy=RetryPolicy(max_attempts=50, base_s=0.02, factor=1, jitter=0.0)
+    )
+    add_demo_routes(built)
+    async with built.app.router.lifespan_context(built.app):
+        yield built
+    await built.poster.aclose()
+
+
+@pytest.fixture
+async def quick_http(quick: Demo) -> AsyncIterator[httpx.AsyncClient]:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=quick.app), base_url="http://demo.test"
+    ) as client:
+        yield client
+
+
+async def deliver_everything(demo: Demo, *, until_received: int | None = None) -> None:
+    """Run the webhook sender until nothing is left to send (or the partner has ``n`` updates)."""
+    async with asyncio.timeout(10):
+        while True:
+            await demo.sender.run_once()
+            view = await demo.partner_view()
+            settled = all(u["delivery"] == "delivered" for u in view["updates"])
+            if (
+                view["updates"]
+                and settled
+                and (until_received is None or view["received"] >= until_received)
+            ):
+                return
+            await asyncio.sleep(0.03)
+
+
+async def fly_to_the_end(demo: Demo, http: httpx.AsyncClient) -> str:
+    _, order_id = await place(http)
+    assert (await dispatch(http, order_id))["outcome"] == "started"
+
+    async def delivered() -> bool:
+        return await status(http, order_id) == "delivered"
+
+    await run_until(demo, delivered)
+    return order_id
+
+
+JOURNEY = ["created", "assigned", "picked_up", "in_flight", "arriving", "delivered"]
+
+
+class TestThePartnerHearsAboutIt:
+    async def test_every_change_reaches_the_partner_in_order_and_signed(
+        self, quick: Demo, quick_http: httpx.AsyncClient
+    ) -> None:
+        await fly_to_the_end(quick, quick_http)
+
+        await deliver_everything(quick, until_received=6)
+
+        assert [r["status"] for r in quick.partner.received] == JOURNEY
+        assert all(r["signature_ok"] for r in quick.partner.received)
+        assert [r["attempt"] for r in quick.partner.received] == [1] * 6
+        assert quick.partner.duplicates == quick.partner.refused == 0
+
+    async def test_the_page_data_shows_each_update_and_how_it_went(
+        self, quick: Demo, quick_http: httpx.AsyncClient
+    ) -> None:
+        await fly_to_the_end(quick, quick_http)
+        await deliver_everything(quick, until_received=6)
+
+        view = (await quick_http.get("/demo/partner/view")).json()
+
+        assert set(view) == {"down", "updates", "received", "refused", "duplicates"}
+        assert [u["update"] for u in reversed(view["updates"])] == [
+            s.replace("_", " ") for s in JOURNEY
+        ]
+        assert {u["delivery"] for u in view["updates"]} == {"delivered"}
+        assert view["received"] == 6
+        assert view["down"] is False
+
+    async def test_a_partner_that_is_down_does_not_stop_a_delivery_and_catches_up_in_order(
+        self, quick: Demo, quick_http: httpx.AsyncClient
+    ) -> None:
+        down = await quick_http.post("/demo/partner/down?down=true")
+        assert down.json() == {"down": True}
+        task = asyncio.create_task(quick.run_webhooks())
+        try:
+            order_id = await fly_to_the_end(quick, quick_http)  # the flight does not care
+
+            async with asyncio.timeout(10):
+                while (await quick.partner_view())["refused"] < 2:
+                    await asyncio.sleep(0.03)
+            waiting = await quick.partner_view()
+            assert await status(quick_http, order_id) == "delivered"
+            assert quick.partner.received == []
+            assert {u["delivery"] for u in waiting["updates"]} == {"pending"}
+            first = waiting["updates"][-1]  # the oldest: the order's creation
+            assert first["attempts"] >= 1
+            assert first["error"] == "HTTP 503"
+
+            await quick_http.post("/demo/partner/down?down=false")
+            async with asyncio.timeout(10):
+                while len(quick.partner.received) < 6:
+                    await asyncio.sleep(0.03)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert [r["status"] for r in quick.partner.received] == JOURNEY  # in order, once each
+        assert quick.partner.duplicates == 0
+        assert quick.partner.received[0]["attempt"] > 1  # the first update needed retries
+        assert quick.partner.refused >= 2
+
+    async def test_a_cancellation_is_told_too(
+        self, quick: Demo, quick_http: httpx.AsyncClient
+    ) -> None:
+        external_id, _ = await place(quick_http)
+        await quick_http.post(f"/partner/mock/orders/{external_id}/cancel")
+
+        await deliver_everything(quick, until_received=2)
+
+        assert [r["status"] for r in quick.partner.received] == ["created", "cancelled"]
+
+
+class TestTheDemoPartner:
+    def headers(
+        self, body: bytes, *, secret: str = "demo-secret", event: str = "e-1"
+    ) -> dict[str, str]:
+        timestamp = 1_700_000_000
+        return {
+            "x-event-id": event,
+            "x-delivery-attempt": "1",
+            "x-timestamp": str(timestamp),
+            "x-signature": sign(secret, timestamp, body),
+        }
+
+    BODY = b'{"order_id":"O-1","status":"created","event_id":"e-1","occurred_at":"x"}'
+
+    def test_it_accepts_a_signed_update_once_and_ignores_a_repeat(self) -> None:
+        partner = MockPartner()
+
+        first = partner.handle(body=self.BODY, headers=self.headers(self.BODY))
+        again = partner.handle(body=self.BODY, headers=self.headers(self.BODY))
+
+        assert (first, again) == (204, 200)
+        assert len(partner.received) == 1
+        assert partner.duplicates == 1
+        assert partner.received[0]["signature_ok"] is True
+
+    def test_a_bad_signature_is_noticed(self) -> None:
+        partner = MockPartner()
+
+        partner.handle(body=self.BODY, headers=self.headers(self.BODY, secret="someone else"))
+
+        assert partner.received[0]["signature_ok"] is False
+
+    @pytest.mark.parametrize("body", [b"not json", b""])
+    def test_a_body_that_is_not_json_is_a_400(self, body: bytes) -> None:
+        assert MockPartner().handle(body=body, headers=self.headers(body)) == 400
+
+    def test_missing_headers_are_a_400(self) -> None:
+        assert MockPartner().handle(body=self.BODY, headers={}) == 400
+
+    def test_when_it_is_down_it_answers_503_and_keeps_nothing(self) -> None:
+        partner = MockPartner(down=True)
+
+        code = partner.handle(body=self.BODY, headers=self.headers(self.BODY))
+
+        assert code == 503
+        assert (partner.received, partner.refused) == ([], 1)
+
+
+class TestTheWebhookRoutes:
+    async def test_the_partner_routes_are_not_part_of_the_platform_api(
+        self, http: httpx.AsyncClient
+    ) -> None:
+        paths = (await http.get("/openapi.json")).json()["paths"]
+
+        assert not [p for p in paths if p.startswith("/demo")]
+
+    async def test_the_receiver_answers_what_the_partner_would(
+        self, demo: Demo, http: httpx.AsyncClient
+    ) -> None:
+        body = TestTheDemoPartner.BODY
+        headers = TestTheDemoPartner().headers(body)
+
+        accepted = await http.post("/demo/partner/webhook", content=body, headers=headers)
+        down = await http.post("/demo/partner/down?down=true")
+        refused = await http.post("/demo/partner/webhook", content=body, headers=headers)
+
+        assert accepted.status_code == 204
+        assert down.json() == {"down": True}
+        assert refused.status_code == 503
+
+    async def test_the_page_has_the_panel(self, http: httpx.AsyncClient) -> None:
+        page = (await http.get("/")).text
+
+        for needle in (
+            "Partner webhooks",
+            "partnerdown",
+            "/demo/partner/view",
+            "/demo/partner/down",
+        ):
+            assert needle in page

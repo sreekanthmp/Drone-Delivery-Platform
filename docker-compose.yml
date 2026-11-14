@@ -98,6 +98,22 @@ services:
       REDIS_URL: redis://redis:6379/0
     command: ["python", "-m", "app.worker"]
 
+  # Tells partners about order status changes (webhooks). Needs WEBHOOK_ENDPOINTS, as one line of
+  # JSON ({"<client_id>": {"url": "https://...", "secret": "optional"}}), so it is opt-in:
+  #   WEBHOOK_ENDPOINTS='{"mock": {"url": "https://example.test/hook"}}' \
+  #     docker compose --profile webhooks up
+  # Safe to run several copies: a delivery is claimed by one sender at a time.
+  webhooks:
+    build: .
+    profiles: ["webhooks"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://drone:drone@postgres:5432/drone
+      WEBHOOK_ENDPOINTS: ${WEBHOOK_ENDPOINTS:-}
+    command: ["python", "-m", "app.webhooks"]
+
   # Plays the drones: registers sim-1..sim-3 with the API and flies the missions it is sent.
   simulator:
     build: .

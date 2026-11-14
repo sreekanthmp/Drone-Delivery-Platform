@@ -17,7 +17,7 @@ import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 import httpx
 
@@ -54,11 +54,22 @@ class HttpxPoster:
         timeout_s: float = 10.0,
         connect_timeout_s: float = 3.0,
         client: httpx.AsyncClient | None = None,
+        close_client: bool | None = None,
     ) -> None:
         self._timeout_s = timeout_s
         self._timeout = httpx.Timeout(timeout_s, connect=min(connect_timeout_s, timeout_s))
-        self._owns_client = client is None
+        # A client we were handed is the caller's to close, unless they say otherwise.
+        self._owns_client = (client is None) if close_client is None else close_client
         self._client = client or httpx.AsyncClient()
+
+    @classmethod
+    def in_process(cls, app: Any, *, timeout_s: float = 10.0) -> HttpxPoster:
+        """A poster that talks to an ASGI app in this process, with no socket (demo and tests).
+
+        It is the same code path as a real POST: the same limits, the same result mapping.
+        """
+        client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app))
+        return cls(timeout_s=timeout_s, client=client, close_client=True)
 
     async def aclose(self) -> None:
         if self._owns_client:

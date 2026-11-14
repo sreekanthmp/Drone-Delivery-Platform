@@ -250,3 +250,202 @@ class TestLiveView:
     def test_nonsense_values_are_refused(self, name: str, value: str) -> None:
         with pytest.raises(ValidationError):
             make(**{name: value})
+
+
+class TestWebhooks:
+    def test_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in ("WEBHOOK_ENDPOINTS", "WEBHOOK_TIMEOUT_SECONDS", "WEBHOOK_MAX_ATTEMPTS"):
+            monkeypatch.delenv(name, raising=False)
+
+        settings = make()
+
+        assert settings.webhook_endpoints == {}
+        assert settings.webhook_timeout_seconds == 10.0
+        assert settings.webhook_connect_timeout_seconds == 3.0
+        assert settings.webhook_max_attempts == 8
+        assert settings.webhook_backoff_base_seconds == 5.0
+        assert settings.webhook_backoff_factor == 3.0
+        assert settings.webhook_backoff_cap_seconds == 3600.0
+        assert settings.webhook_backoff_jitter == 0.2
+        assert settings.webhook_lease_seconds == 60.0
+        assert settings.webhook_poll_seconds == 1.0
+        assert settings.webhook_batch_size == 20
+        assert settings.webhook_concurrency == 10
+
+    def test_endpoints_are_read_from_json_in_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "WEBHOOK_ENDPOINTS",
+            '{"mock": {"url": "https://a.example/h", "secret": "s3cret"},'
+            ' "zomato": {"url": "http://127.0.0.1:9000/hook"}}',
+        )
+
+        settings = make()
+
+        assert set(settings.webhook_endpoints) == {"mock", "zomato"}
+        mock = settings.webhook_endpoints["mock"]
+        assert mock.url == "https://a.example/h"
+        assert mock.secret is not None
+        assert mock.secret.get_secret_value() == "s3cret"
+        assert settings.webhook_endpoints["zomato"].secret is None
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\n"])
+    def test_a_blank_value_means_no_endpoints(
+        self, monkeypatch: pytest.MonkeyPatch, blank: str
+    ) -> None:
+        """What ``WEBHOOK_ENDPOINTS=`` in an env file, or compose's ``${X:-}``, produces."""
+        monkeypatch.setenv("WEBHOOK_ENDPOINTS", blank)
+
+        assert make().webhook_endpoints == {}
+
+    def test_endpoints_can_be_passed_directly(self) -> None:
+        settings = make(webhook_endpoints={"mock": {"url": "https://a.example/h"}})  # type: ignore[arg-type]
+
+        assert settings.webhook_endpoints["mock"].url == "https://a.example/h"
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "{not json",
+            "[1, 2]",
+            '"a string"',
+            '{"mock": "https://a.example/h"}',  # needs an object with a url
+            '{"mock": {"url": "ftp://a.example/h"}}',
+            '{"mock": {"url": "https://user:pw@a.example/h"}}',
+            '{"mock": {"url": "https://a.example/h", "scret": "typo"}}',
+            '{"Mock": {"url": "https://a.example/h"}}',  # not a client id
+            '{"": {"url": "https://a.example/h"}}',
+            '{"-mock": {"url": "https://a.example/h"}}',
+            '{"mo ck": {"url": "https://a.example/h"}}',
+        ],
+    )
+    def test_nonsense_is_refused(self, monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+        monkeypatch.setenv("WEBHOOK_ENDPOINTS", bad)
+
+        with pytest.raises(ValidationError):
+            make()
+
+    def test_malformed_json_says_what_was_expected_and_where_it_went_wrong(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WEBHOOK_ENDPOINTS", '{"mock": {"url": ')
+
+        with pytest.raises(ValidationError) as caught:
+            make()
+
+        message = str(caught.value)
+        assert (
+            'WEBHOOK_ENDPOINTS must be JSON like {"<client_id>": {"url": "https://..."}}' in message
+        )
+        assert "position" in message
+
+    def test_a_refusal_never_echoes_a_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(
+            "WEBHOOK_ENDPOINTS",
+            '{"Mock": {"url": "https://a.example/h", "secret": "TOPSECRET"}}',
+        )
+
+        with pytest.raises(ValidationError) as caught:
+            make()
+
+        assert "TOPSECRET" not in str(caught.value)
+        assert "TOPSECRET" not in repr(caught.value)
+
+    def test_a_secret_is_hidden_when_the_settings_are_printed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "WEBHOOK_ENDPOINTS", '{"mock": {"url": "https://a.example/h", "secret": "TOPSECRET"}}'
+        )
+
+        settings = make()
+
+        assert "TOPSECRET" not in repr(settings)
+        assert "TOPSECRET" not in str(settings.model_dump())
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("WEBHOOK_TIMEOUT_SECONDS", "0"),
+            ("WEBHOOK_CONNECT_TIMEOUT_SECONDS", "-1"),
+            ("WEBHOOK_MAX_ATTEMPTS", "0"),
+            ("WEBHOOK_BACKOFF_BASE_SECONDS", "0"),
+            ("WEBHOOK_BACKOFF_FACTOR", "0.5"),
+            ("WEBHOOK_BACKOFF_CAP_SECONDS", "0"),
+            ("WEBHOOK_BACKOFF_JITTER", "1"),
+            ("WEBHOOK_BACKOFF_JITTER", "-0.1"),
+            ("WEBHOOK_LEASE_SECONDS", "0"),
+            ("WEBHOOK_POLL_SECONDS", "0"),
+            ("WEBHOOK_BATCH_SIZE", "0"),
+            ("WEBHOOK_CONCURRENCY", "0"),
+        ],
+    )
+    def test_the_numbers_are_bounded(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, value: str
+    ) -> None:
+        monkeypatch.setenv(name, value)
+
+        with pytest.raises(ValidationError):
+            make()
+
+    def test_the_lease_must_outlast_a_request(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Or a slow partner would be sent the same update again while the first is in flight."""
+        monkeypatch.setenv("WEBHOOK_TIMEOUT_SECONDS", "30")
+        monkeypatch.setenv("WEBHOOK_LEASE_SECONDS", "30")
+
+        with pytest.raises(ValidationError, match="longer than webhook_timeout_seconds"):
+            make()
+
+        monkeypatch.setenv("WEBHOOK_LEASE_SECONDS", "31")
+        assert make().webhook_lease_seconds == 31
+
+
+class TestTheDocumentedConfiguration:
+    ROOT = Path(__file__).resolve().parents[2]
+
+    def test_every_webhook_setting_is_in_the_env_example(self) -> None:
+        example = (self.ROOT / ".env.example").read_text()
+
+        missing = [
+            name.upper()
+            for name in Settings.model_fields
+            if name.startswith("webhook_") and name.upper() not in example
+        ]
+
+        assert missing == []
+
+    def test_the_env_example_values_are_the_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An example that disagrees with the code is worse than none."""
+        for line in (self.ROOT / ".env.example").read_text().splitlines():
+            name, _, value = line.partition("=")
+            if name.startswith("WEBHOOK_") and name != "WEBHOOK_ENDPOINTS":
+                monkeypatch.setenv(name, value)
+
+        from_example = make().model_dump(exclude={"webhook_endpoints"})
+        monkeypatch.undo()
+        defaults = make().model_dump(exclude={"webhook_endpoints"})
+
+        assert {k: v for k, v in from_example.items() if k.startswith("webhook_")} == {
+            k: v for k, v in defaults.items() if k.startswith("webhook_")
+        }
+
+    def test_the_documented_endpoint_example_is_valid(self) -> None:
+        example = next(
+            line
+            for line in (self.ROOT / ".env.example").read_text().splitlines()
+            if line.startswith("# WEBHOOK_ENDPOINTS=")
+        )
+
+        settings = make(webhook_endpoints=example.removeprefix("# WEBHOOK_ENDPOINTS="))  # type: ignore[arg-type]
+
+        assert list(settings.webhook_endpoints) == ["mock"]
+
+    def test_compose_runs_the_documented_sender_as_an_opt_in_service(self) -> None:
+        compose = (self.ROOT / "docker-compose.yml").read_text()
+        service = compose.split("\n  webhooks:\n", 1)[1].split("\n  simulator:", 1)[0]
+
+        assert 'command: ["python", "-m", "app.webhooks"]' in service
+        assert 'profiles: ["webhooks"]' in service  # not started by a plain `docker compose up`
+        assert "WEBHOOK_ENDPOINTS" in service
+        assert "ports:" not in service  # it serves nothing

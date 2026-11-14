@@ -50,6 +50,8 @@ WRITE_OPERATIONS: dict[tuple[str, str], set[str]] = {
     ("POST", "/internal/flights/{flight_id}/resume"): {"flight_id"},
     ("POST", "/internal/flights/{flight_id}/return-to-home"): {"flight_id", "reason"},
     ("POST", "/internal/flights/{flight_id}/land"): {"flight_id", "reason"},
+    # gives a FAILED webhook delivery another round of attempts; touches no order and no drone
+    ("POST", "/internal/webhooks/deliveries/{event_id}/retry"): {"event_id"},
 }
 
 READ_OPERATIONS = {
@@ -63,6 +65,9 @@ READ_OPERATIONS = {
     ("GET", "/internal/drones/{drone_id}"),
     ("GET", "/internal/flights/{flight_id}"),
     ("GET", "/internal/alerts"),
+    ("GET", "/internal/webhooks/deliveries"),
+    ("GET", "/internal/webhooks/deliveries/{event_id}"),
+    ("GET", "/internal/orders/{order_id}/webhooks"),
 }
 
 EXPECTED_OPERATIONS = READ_OPERATIONS | set(WRITE_OPERATIONS)
@@ -144,7 +149,11 @@ def status_writing_operations(app: FastAPI) -> list[str]:
     for (method, path), operation in operations(schema).items():
         if method in {"PUT", "PATCH", "DELETE"}:
             problems.append(f"{method} {path}: forbidden method")
-        if any("status" in name.lower() for name in input_names(schema, operation)):
+        # A read cannot write a status, so a filter such as ``GET ...?status=failed`` is fine;
+        # anything that can change something must not accept one.
+        if method not in READ_ONLY and any(
+            "status" in name.lower() for name in input_names(schema, operation)
+        ):
             problems.append(f"{method} {path}: accepts a field named like 'status'")
     return problems
 
@@ -266,6 +275,33 @@ def test_the_inspection_flags_a_patch_with_a_status_body() -> None:
 def test_the_inspection_flags_a_status_query_parameter() -> None:
     problems = status_writing_operations(_bad_app())
     assert any(p.startswith("POST /orders/{order_id}/transition") for p in problems)
+
+
+def test_a_status_filter_on_a_read_is_not_a_status_write() -> None:
+    """``GET /internal/webhooks/deliveries?status=failed`` lists; it cannot write anything."""
+    ok = FastAPI()
+
+    @ok.get("/deliveries")
+    async def list_deliveries(status: str | None = None) -> None: ...
+
+    @ok.head("/deliveries")
+    async def head_deliveries(status: str | None = None) -> None: ...
+
+    assert status_writing_operations(ok) == []
+
+
+def test_the_status_filter_is_still_refused_on_anything_that_writes() -> None:
+    bad = FastAPI()
+
+    @bad.post("/deliveries")
+    async def create(status: str) -> None: ...
+
+    @bad.post("/deliveries/{delivery_id}/retry")
+    async def retry(delivery_id: str, body: _StatusBody) -> None: ...
+
+    problems = status_writing_operations(bad)
+    assert len(problems) == 2
+    assert all("'status'" in p for p in problems)
 
 
 class _Goto(BaseModel):

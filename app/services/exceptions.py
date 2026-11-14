@@ -39,3 +39,22 @@ class ConcurrentUpdateError(ServiceError):
 
     Row locking makes this rare; it is the compare-and-set safety net.
     """
+
+
+class DeliveryNotFoundError(ServiceError):
+    """No webhook delivery has the given id (an order audit event id)."""
+
+    def __init__(self, event_id: UUID) -> None:
+        self.event_id = event_id
+        super().__init__(f"Webhook delivery {event_id} not found")
+
+
+class DeliveryNotRetryableError(ServiceError):
+    """Another round of attempts was asked for a delivery that cannot have one."""
+
+    def __init__(self, event_id: UUID, status: str) -> None:
+        self.event_id = event_id
+        self.status = status
+        super().__init__(
+            f"Webhook delivery {event_id} is {status}; only a failed delivery can be retried"
+        )

@@ -23,7 +23,7 @@
   header { padding: 18px 20px 6px; max-width: 1180px; margin: 0 auto; }
   h1 { margin: 0 0 4px; font-size: 20px; }
   header p { margin: 0; color: var(--muted); max-width: 70ch; }
-  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px;
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start;
          padding: 12px 20px 28px; max-width: 1180px; margin: 0 auto; }
   @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
@@ -55,6 +55,16 @@
   #log { max-height: 150px; overflow: auto; font: 12.5px/1.5 ui-monospace, Menlo, Consolas, monospace;
          color: var(--muted); }
   #log div b { color: var(--ink); font-weight: 600; }
+  .hint { color: var(--muted); font-size: 13px; margin: 0 0 6px; }
+  #hooks { margin-top: 8px; max-height: 190px; overflow: auto; font-size: 13.5px; }
+  .hook { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0 3px 10px;
+          border-left: 3px solid var(--line); color: var(--muted); }
+  .hook b { color: var(--ink); font-weight: 600; white-space: nowrap; }
+  .hook span { text-align: right; }
+  .hook.ok { border-left-color: var(--ok); }
+  .hook.warn { border-left-color: var(--warn); color: var(--ink); }
+  .hook.bad { border-left-color: var(--bad); color: var(--ink); }
+  #hooksum { margin-top: 8px; margin-bottom: 0; }
   .legend { display: flex; gap: 14px; padding: 8px 14px 12px; color: var(--muted); font-size: 13px; flex-wrap: wrap; }
   .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
 </style>
@@ -88,6 +98,14 @@
     <div class="card pad">
       <h2>Order progress</h2>
       <ol id="steps"></ol>
+    </div>
+    <div class="card pad">
+      <h2>Partner webhooks</h2>
+      <p class="hint">The platform tells the partner about every status change, in the partner's
+        own format, and retries if the partner's server is down.</p>
+      <label><input type="checkbox" id="partnerdown"> Partner's server is down (it answers 503)</label>
+      <div id="hooks"><div class="hint">Nothing sent yet.</div></div>
+      <p class="hint" id="hooksum"></p>
     </div>
     <div class="card pad">
       <h2>Drones</h2>
@@ -258,14 +276,38 @@ async function cancelOrder() {
   await fetch(`/partner/mock/orders/${current.ext}/cancel`, { method: "POST" });
 }
 async function setAirspace(closed) { await fetch(`/demo/airspace?closed=${closed}`, { method: "POST" }); }
+async function setPartnerDown(down) { await fetch(`/demo/partner/down?down=${down}`, { method: "POST" }); }
+
+// ---- the partner's webhooks ----------------------------------------------------------------
+const esc = (text) => String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function hookRow(u) {
+  let cls = "", text = u.delivery;
+  if (u.delivery === "delivered") { cls = "ok"; text = u.attempts > 1 ? `delivered (attempt ${u.attempts})` : "delivered"; }
+  else if (u.delivery === "pending" && u.attempts === 0) { text = "queued"; }
+  else if (u.delivery === "pending") { cls = "warn"; text = `retrying in ${u.retry_in_s}s (attempt ${u.attempts}: ${esc(u.error)})`; }
+  else if (u.delivery === "failed") { cls = "bad"; text = `gave up: ${esc(u.error)}`; }
+  return `<div class="hook ${cls}"><b>${esc(u.update)}</b><span>${text}</span></div>`;
+}
+let partnerSynced = false;
+async function pollHooks() {
+  try {
+    const v = await (await fetch("/demo/partner/view")).json();
+    if (!partnerSynced) { $("partnerdown").checked = v.down; partnerSynced = true; }
+    $("hooks").innerHTML = v.updates.length ? v.updates.map(hookRow).join("") : '<div class="hint">Nothing sent yet.</div>';
+    $("hooksum").textContent = `The partner has received ${v.received} update${v.received === 1 ? "" : "s"}` +
+      (v.refused ? `, and turned ${v.refused} away while it was down` : "") +
+      (v.duplicates ? `, and ignored ${v.duplicates} repeat${v.duplicates === 1 ? "" : "s"}` : "") + ".";
+  } catch (e) { /* the server is busy or restarting: try again next time */ }
+}
 
 $("order").onclick = placeOrder;
 $("cancel").onclick = cancelOrder;
 $("closed").onchange = (e) => setAirspace(e.target.checked);
+$("partnerdown").onchange = (e) => setPartnerDown(e.target.checked);
 
 (async () => {
   config = await (await fetch("/demo/config")).json();
-  renderSteps(); connect(); draw();
+  renderSteps(); connect(); draw(); pollHooks(); setInterval(pollHooks, 700);
 })();
 </script>
 </body>

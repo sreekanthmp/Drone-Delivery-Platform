@@ -29,6 +29,7 @@ from app.api.internal import alerts as internal_alerts
 from app.api.internal import drones as internal_drones
 from app.api.internal import flights as internal_flights
 from app.api.internal import orders as internal_orders
+from app.api.internal import webhooks as internal_webhooks
 from app.api.partner import router as partner
 from app.api.ws import internal as ws_internal
 from app.api.ws import partner as ws_partner
@@ -51,6 +52,7 @@ from app.realtime.ports import LiveView
 from app.realtime.redis_backend import RedisRealtime
 from app.services.order_service import OrderService
 from app.services.ports import UnitOfWorkFactory
+from app.services.webhook_service import WebhookService
 
 logger = structlog.get_logger(__name__)
 
@@ -140,6 +142,7 @@ def create_app(
     def wire(app: FastAPI, factory: UnitOfWorkFactory) -> None:
         orders = OrderService(factory, notifier=notifier)
         app.state.order_service = orders
+        app.state.webhook_service = WebhookService(factory)
         app.state.compliance = compliance
         app.state.drone_link = drone_link
         app.state.realtime = realtime
@@ -198,6 +201,7 @@ def create_app(
     app.include_router(internal_drones.router)
     app.include_router(internal_flights.router)
     app.include_router(internal_alerts.router)
+    app.include_router(internal_webhooks.router)
     app.include_router(ws_internal.router)
     app.include_router(ws_partner.router)
     return app

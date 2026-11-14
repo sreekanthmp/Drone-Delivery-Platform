@@ -9,6 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.dispatch.service import DispatchResult
 from app.domain.models import (
+    AttemptOutcome,
+    DeliveryAttempt,
+    DeliveryStatus,
     Drone,
     DroneStatus,
     Flight,
@@ -19,8 +22,10 @@ from app.domain.models import (
     OrderStatus,
     Package,
     PermissionDenial,
+    WebhookDelivery,
 )
 from app.realtime.models import Alert
+from app.services.webhook_service import DeliveryDetail
 
 
 class LocationOut(BaseModel):
@@ -304,4 +309,73 @@ class AlertsOut(BaseModel):
             live=True,
             active=[AlertOut.from_domain(a) for a in active],
             recent=[AlertOut.from_domain(a) for a in recent],
+        )
+
+
+class DeliveryOut(BaseModel):
+    """One notification owed to a partner: an order status change, and how its delivery is going."""
+
+    event_id: UUID
+    """The order audit event it reports. Also the idempotency key the partner receives."""
+
+    order_id: UUID
+    client_id: str
+    status: DeliveryStatus
+    attempts: int
+    next_attempt_at: datetime
+    """When the next attempt is due (meaningful while the delivery is pending)."""
+
+    last_status_code: int | None
+    last_error: str | None
+    delivered_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_domain(cls, delivery: WebhookDelivery) -> DeliveryOut:
+        return cls(
+            event_id=delivery.event_id,
+            order_id=delivery.order_id,
+            client_id=delivery.client_id,
+            status=delivery.status,
+            attempts=delivery.attempts,
+            next_attempt_at=delivery.next_attempt_at,
+            last_status_code=delivery.last_status_code,
+            last_error=delivery.last_error,
+            delivered_at=delivery.delivered_at,
+            created_at=delivery.created_at,
+            updated_at=delivery.updated_at,
+        )
+
+
+class AttemptOut(BaseModel):
+    attempt_no: int
+    started_at: datetime
+    duration_ms: int
+    outcome: AttemptOutcome
+    status_code: int | None
+    error: str | None
+
+    @classmethod
+    def from_domain(cls, attempt: DeliveryAttempt) -> AttemptOut:
+        return cls(
+            attempt_no=attempt.attempt_no,
+            started_at=attempt.started_at,
+            duration_ms=attempt.duration_ms,
+            outcome=attempt.outcome,
+            status_code=attempt.status_code,
+            error=attempt.error,
+        )
+
+
+class DeliveryDetailOut(BaseModel):
+    delivery: DeliveryOut
+    attempts: list[AttemptOut]
+    """Every HTTP attempt at the delivery, oldest first: the failure history."""
+
+    @classmethod
+    def from_domain(cls, detail: DeliveryDetail) -> DeliveryDetailOut:
+        return cls(
+            delivery=DeliveryOut.from_domain(detail.delivery),
+            attempts=[AttemptOut.from_domain(a) for a in detail.attempts],
         )

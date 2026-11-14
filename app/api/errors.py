@@ -27,7 +27,12 @@ from app.domain.exceptions import (
     InvalidTransitionError,
     OrderValidationError,
 )
-from app.services.exceptions import ConcurrentUpdateError, OrderNotFoundError
+from app.services.exceptions import (
+    ConcurrentUpdateError,
+    DeliveryNotFoundError,
+    DeliveryNotRetryableError,
+    OrderNotFoundError,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -72,6 +77,8 @@ async def _unexpected(request: Request, exc: Exception) -> JSONResponse:
 
 def register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(OrderNotFoundError, _not_found)
+    app.add_exception_handler(DeliveryNotFoundError, _not_found)
+    app.add_exception_handler(DeliveryNotRetryableError, _conflict)
     for not_found in (DroneNotFoundError, FlightNotFoundError):
         app.add_exception_handler(not_found, _not_found)
     for conflict in (

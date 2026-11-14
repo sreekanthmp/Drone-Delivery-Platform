@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
+import json
+import re
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.mqtt.url import parse_mqtt_url
+from app.webhooks.endpoints import WebhookEndpoint
 
 _ASYNC_PG_PREFIX = "postgresql+asyncpg://"
+_CLIENT_ID = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    # A bad value must never be echoed back: WEBHOOK_ENDPOINTS carries partners' secrets, and
+    # a validation error would otherwise print the whole raw string.
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore", hide_input_in_errors=True
+    )
 
     database_url: str = f"{_ASYNC_PG_PREFIX}drone:drone@localhost:5432/drone"
     database_echo: bool = False
@@ -69,6 +77,64 @@ class Settings(BaseSettings):
 
     watchdog_interval_seconds: float = Field(default=5.0, gt=0)
     reaper_interval_seconds: float = Field(default=60.0, gt=0)
+
+    # Webhooks (Phase 6): telling partners about order status changes. Only the sender process
+    # (``python -m app.webhooks``) reads these. ``webhook_endpoints`` maps a client id to where
+    # its updates go, as JSON: {"<client_id>": {"url": "https://...", "secret": "optional"}}.
+    # A client with no entry is simply not told (its deliveries are marked skipped).
+    webhook_endpoints: Annotated[dict[str, WebhookEndpoint], NoDecode] = Field(default_factory=dict)
+    webhook_timeout_seconds: float = Field(default=10.0, gt=0)
+    """The whole request, from connecting to the partner's status line."""
+
+    webhook_connect_timeout_seconds: float = Field(default=3.0, gt=0)
+    webhook_max_attempts: int = Field(default=8, ge=1)
+    """Attempts in one round. With the default waits that is about an hour and a half."""
+
+    webhook_backoff_base_seconds: float = Field(default=5.0, gt=0)
+    webhook_backoff_factor: float = Field(default=3.0, ge=1)
+    webhook_backoff_cap_seconds: float = Field(default=3600.0, gt=0)
+    webhook_backoff_jitter: float = Field(default=0.2, ge=0, lt=1)
+    webhook_lease_seconds: float = Field(default=60.0, gt=0)
+    """How long a sender owns a delivery it has claimed. It must outlast a request, or a slow
+    partner would be sent the same update again while the first is still in flight."""
+
+    webhook_poll_seconds: float = Field(default=1.0, gt=0)
+    webhook_batch_size: int = Field(default=20, ge=1)
+    webhook_concurrency: int = Field(default=10, ge=1)
+
+    @field_validator("webhook_endpoints", mode="before")
+    @classmethod
+    def _read_endpoints(cls, value: object) -> object:
+        """JSON from the environment; blank means none (like ``REDIS_URL=`` in an env file)."""
+        if not isinstance(value, str):
+            return value
+        if not value.strip():
+            return {}
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as problem:
+            raise ValueError(
+                'WEBHOOK_ENDPOINTS must be JSON like {"<client_id>": {"url": "https://..."}} '
+                f"({problem.msg} at position {problem.pos})"
+            ) from None
+
+    @field_validator("webhook_endpoints")
+    @classmethod
+    def _client_ids_look_like_client_ids(
+        cls, value: dict[str, WebhookEndpoint]
+    ) -> dict[str, WebhookEndpoint]:
+        for client_id in value:
+            if not _CLIENT_ID.fullmatch(client_id):
+                raise ValueError(
+                    f"'{client_id}' is not a client id (lowercase letters, digits, '-' and '_')"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def _the_lease_outlasts_a_request(self) -> Settings:
+        if self.webhook_lease_seconds <= self.webhook_timeout_seconds:
+            raise ValueError("webhook_lease_seconds must be longer than webhook_timeout_seconds")
+        return self
 
     @field_validator("redis_url")
     @classmethod

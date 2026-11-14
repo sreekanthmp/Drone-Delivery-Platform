@@ -27,6 +27,10 @@ home. **Cancel order** recalls the drone. Tick **Close the airspace** first and 
 refuses permission, so no drone takes off (Rule 2). Order several at once to use both drones; a
 third gets `no_drone_available`.
 
+The **Partner webhooks** panel shows the platform telling the demo's own partner server about each
+status change. Tick **Partner's server is down** and the flight carries on while the updates queue
+and retry; untick it and they catch up, in order.
+
 Options: `--port 8000`, `--host 127.0.0.1`, `--speed 60` (how much faster than real time the
 simulated drones run; at the default an order is delivered about ten seconds after you place it,
 and the drone is home a few seconds later). It is a prototype: everything is lost on exit, the
@@ -498,6 +502,92 @@ URL, so anyone who knows an order's id can watch it. Do not expose them publicly
   is fine for a modest fleet; a very large one would shard the channels.
 - A partner position is the drone's last sample (about once a second), not interpolated.
 
+## Webhooks: telling partners about order changes
+
+Every order status change is sent to the partner that owns the order, in the partner's own format
+(Rule 3: its adapter builds the body; the sender never sees a partner format). Flight and drone
+details never leave the platform. A separate **sender** process does the work, so it can be
+restarted, scaled or stopped without touching orders or flights.
+
+```text
+order change  --(same transaction)-->  audit event  +  webhook delivery (queued)
+                                                              |
+sender: claim --> render with the partner's adapter --> POST --> record the outcome
+```
+
+* **Nothing is lost.** The delivery is queued by the same store call that writes the order's audit
+  event, in the same transaction: an order change cannot exist without its notification (the same
+  guarantee Rule 5 gives for the audit event).
+* **At-least-once, not exactly-once.** A sender that dies after the POST but before recording it
+  sends again when its lease runs out. Every attempt at an update carries the same
+  `X-Event-Id` (the audit event's id), so a partner that de-duplicates on it drops a repeat.
+* **In order.** An order's updates go out one at a time, oldest first: a later update waits while an
+  earlier one is still being retried. An update that has *failed for good* does not block the next.
+* **Retries.** A 2xx is delivered. A network error, a timeout, a 5xx, 408 or 429 is retried with a
+  jittered exponential backoff (5 s, x3 each time, capped at an hour; a `Retry-After` is honoured, up
+  to the cap), 8 attempts in all, about an hour and a half. Any other 4xx, and any redirect (never
+  followed), fails at once: repeating the same request would get the same answer.
+* **Limits.** One total deadline per request (10 s, connecting included), the response body is
+  never read, redirects are never followed.
+* **Several senders.** Claiming uses row locks and a lease, so you can run more than one.
+
+### Running the sender
+
+Tell it where each partner's updates go, as one line of JSON keyed by client id, then run it:
+
+```bash
+export WEBHOOK_ENDPOINTS='{"mock": {"url": "https://partner.example/hooks/orders", "secret": "change-me"}}'
+uv run python -m app.webhooks
+```
+
+or with compose (opt-in): `docker compose --profile webhooks up`. All settings (timeouts, attempts,
+backoff, lease, batch size) are in `.env.example`.
+
+* A client with **no entry** is simply not told: its deliveries are marked `skipped` (final).
+* The sender **refuses to start with no endpoints at all**, or with an endpoint for a client that has
+  no adapter, and says why (exit code 2). Otherwise a typo in a variable name would mark every
+  delivery skipped, which cannot be undone.
+* Errors in the settings never echo the value, because it can contain a secret.
+
+### What a partner receives
+
+```text
+POST <your url>
+Content-Type: application/json
+X-Event-Id: 6f0c...           the same on every attempt at this update: de-duplicate on it
+X-Delivery-Attempt: 1         1, 2, 3, ... for this update
+X-Timestamp: 1767225600       only if the partner has a secret
+X-Signature: sha256=<hex>     only if the partner has a secret
+
+{ ...the partner's own status-update format... }
+```
+
+With a secret, the signature is `HMAC-SHA256(secret, "<X-Timestamp>.<raw body>")`: recompute it from the
+raw body, compare in constant time, and reject a timestamp that is too old. (`app/webhooks/signing.py`
+has `verify`, and the demo's partner server uses it.)
+
+### Seeing how it is going (internal API, no authentication like the rest of `/internal`)
+
+| Request | What it answers |
+|---|---|
+| `GET /internal/webhooks/deliveries?status=failed&client_id=mock&limit=50` | notifications, newest first; `status=failed` is "what gave up" |
+| `GET /internal/webhooks/deliveries/{event_id}` | one delivery with **every attempt** at it: status code, error, duration |
+| `GET /internal/orders/{order_id}/webhooks` | the notifications owed for one order, oldest first |
+| `POST /internal/webhooks/deliveries/{event_id}/retry` | give a **failed** delivery another full round (409 for anything else) |
+
+Attempts are recorded in `webhook_attempts`, which, like the audit log, only ever gets inserted into
+(the database rejects `UPDATE`, `DELETE` and `TRUNCATE`).
+
+### Known limits (webhooks)
+
+* Delivery rows and attempts are **never deleted**. They are small, but there is no retention job yet.
+* A partner's endpoint is configured by the operator, not by the partner, and there is no
+  authentication on `/internal` (none was requested): do not expose it.
+* Headers and the signature scheme are the same for every partner; an adapter cannot change them yet.
+* Orders that existed before migration 0003 have no deliveries and get none: it reports changes from
+  now on, it does not replay history.
+* `skipped` is final. If you add a partner's endpoint later, only *new* changes reach it.
+
 ## Development
 
 Requires Python 3.12, [uv](https://docs.astral.sh/uv/) and, for the database,
@@ -565,7 +655,7 @@ database can never look like a green run.
 | 4B | Dispatch workflow, mission planner, drone link (start/pause/RTH/land), cancellation, internal dispatch API | **done** |
 | 5A | MQTT drone link and wire contract, drone-reported progress events, telemetry worker, drone simulator, Mosquitto in compose | **done** |
 | 5B | Telemetry samples, Redis, heartbeats and alerts, reaper for stale reservations, WebSocket tracking streams (ops fleet, order, partner) | **done** |
-| 6 | Webhooks: sender, retries, idempotency, failure tracking | planned |
+| 6 | Webhooks: transactional queue, sender process, retries, idempotency, failure tracking, internal endpoints | **done** |
 | 7 | Ops dashboard APIs, hardening, end-to-end tests | planned |
 
 ## Decisions Log
@@ -694,3 +784,22 @@ database can never look like a green run.
 - [2026-11-14] The demo's MQTT is an in-process loopback (`LoopbackMqtt`) that hands each command to a `SimulatedDrone` and returns its ack, so the real `MqttDroneLink` and the wire contract are exercised without a broker; drone events go straight into the real `TelemetryIngest` and samples into the real `TelemetryRecorder`.
 - [2026-11-14] The in-memory unit of work moved from `tests/fakes.py` to `app/services/memory.py` because the demo needs it in application code; `tests/fakes.py` re-exports it so no test changed. It is not selectable by any production setting.
 - [2026-11-14] The demo page is a view only: it places an order and asks for dispatch through the public partner and internal endpoints, and watches `/ws/internal/fleet`. The "Close the airspace" switch changes only what the mock compliance module answers, so a refusal is the platform's own Rule 2 behaviour, not a demo shortcut. The demo adds no authentication (none is requested).
+- [2026-11-14] Webhooks are queued by the order stores in the same transaction as the order's audit event (a transactional outbox), not by a notifier after the commit (user-approved): a status change cannot exist without its notification, and a crash between the commit and a best-effort call cannot lose one.
+- [2026-11-14] A webhook delivery is identified by the audit event it reports, and that id is also the `X-Event-Id` idempotency key, the same on every attempt: an event is queued at most once, and a partner can drop a repeat. Delivery is at-least-once, never claimed exactly-once.
+- [2026-11-14] A delivery is queued for every client's order events, and the sender marks it `skipped` (final) when the client has no endpoint, rather than the order service being told which clients subscribe (user-approved): the API, the telemetry worker and the demo each build their own order service, and one forgetting the setting would silently drop notifications.
+- [2026-11-14] Only order events are reported to partners, never flight events: a partner sees its order, not our drones, flights, missions or permissions (Rules 1 and 3); the domain model refuses to queue a flight event.
+- [2026-11-14] An order's updates are sent one at a time, oldest first, and a delivery that failed for good does not block the next: ordering matters to a partner, but one dead update must not freeze an order forever (the partner can re-sync through the existing order lookup).
+- [2026-11-14] A 2xx is delivered; a network error, timeout, 5xx, 408 and 429 are retried with a jittered exponential backoff (5 s, x3, capped at an hour, `Retry-After` honoured up to the cap, 8 attempts); any other 4xx and any redirect fail at once (user-approved): repeating a rejected request gets the same answer, and a redirect is never followed.
+- [2026-11-14] A request has one total deadline and the response body is never read; redirects are never followed: per-step timeouts alone let a partner that drips bytes hold a sender forever, and following a redirect would send the platform to a host nobody configured.
+- [2026-11-14] Several senders may run at once (`FOR UPDATE SKIP LOCKED` plus a lease that must outlast a request); the outcome is stored by compare-and-set on the status and attempt count, so a sender whose lease ran out cannot overwrite the one that took over.
+- [2026-11-14] A manual retry gives only a failed delivery a fresh round (the attempt budget restarts, the attempt numbering and history do not) (user-approved): the failure history stays honest, and anything not failed is a 409.
+- [2026-11-14] The failure history lives in its own insert-only `webhook_attempts` table, protected by the same trigger as the audit log, and not in the order audit trail (user-approved): a webhook outcome is not an order or flight status change, and putting it in the audit log would need a new event type and a rewrite of its constraints. Migration 0003 refuses to downgrade over recorded attempts.
+- [2026-11-14] Requests are signed (HMAC-SHA256 over `timestamp.body`) only when a partner has a secret configured (user-approved default): it lets the partner verify us, it is not authentication to our API, and without a secret nothing changes.
+- [2026-11-14] The sender is its own process (`python -m app.webhooks`) and not part of the API or the telemetry worker (user-approved): it can be restarted and scaled independently, and the worker's "exactly one" limit (an MQTT session) does not apply to it.
+- [2026-11-14] The sender refuses to start with no endpoints, or with one for a client that has no adapter (found while building): an unset or misspelt `WEBHOOK_ENDPOINTS` would otherwise mark every delivery `skipped`, which is final.
+- [2026-11-14] A blank `WEBHOOK_ENDPOINTS=` means "none", like a blank `REDIS_URL=`, and settings errors no longer echo the offending value (found while building): compose passes a blank when the variable is unset, which crashed every process, and a validation error printed the raw string, which can contain a partner's secret.
+- [2026-11-14] `httpx` is a runtime dependency and is imported in exactly one module (`app/webhooks/http.py`, enforced by a test): one place a webhook leaves the process, so its limits cannot be bypassed by a second client.
+- [2026-11-14] The test that refuses an input named like `status` now applies only to operations that can write (not `GET`): the approved `GET /internal/webhooks/deliveries?status=failed` filter cannot write a status, and the guard still refuses the name on every `POST`, `PUT`, `PATCH` and `DELETE`.
+- [2026-11-14] A plain `TRUNCATE audit_events` is now refused by the foreign key from `webhook_deliveries` before the append-only trigger runs; `TRUNCATE ... CASCADE` still reaches the trigger, and the audit test checks both: the log is protected twice, and the test still proves the trigger.
+- [2026-11-14] The demo plays a partner with its own server and runs the platform's real sender against it (a real HTTP request, signed and verified), with a switch to take that server down: it shows retries and in-order catch-up without any new platform code.
+- [2026-11-14] Delivery rows and attempts have no retention job yet: they are small, and deleting history deserves its own decision; documented as a known limit.
